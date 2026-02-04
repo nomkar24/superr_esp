@@ -1,0 +1,9 @@
+# ESP-IDF build output
+build/
+managed_components/
+
+# SDK config backups
+sdkconfig.old
+
+# Optional (Windows)
+*.log
