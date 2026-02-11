@@ -5,10 +5,10 @@
 #include "esp_gap_ble_api.h"
 #include "esp_gatts_api.h"
 #include "esp_log.h"
-#include "esp_system.h"
-#include "freertos/FreeRTOS.h"
+// #include "esp_system.h" // Unused
+// #include "freertos/FreeRTOS.h" // Unused
 #include "freertos/task.h"
-#include "nvs_flash.h"
+// #include "nvs_flash.h" // Unused
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,23 +18,21 @@
 #define PROFILE_NUM 1
 #define PROFILE_APP_ID 0
 
-/* MIDI Service UUID: 03B80E5A-EDE8-4B33-A751-6CE34EC4C700 */
+/* MIDI Service & Characteristic UUIDs */
 static uint8_t midi_service_uuid[16] = {0x00, 0xC7, 0xC4, 0x4E, 0xE3, 0x6C,
                                         0x51, 0xA7, 0x33, 0x4B, 0xE8, 0xED,
                                         0x5A, 0x0E, 0xB8, 0x03};
 
-/* MIDI Characteristic UUID: 7772E5DB-3868-4112-A1A9-F2669D106BF3 */
 static uint8_t midi_char_uuid[16] = {0xF3, 0x6B, 0x10, 0x9D, 0x66, 0xF2,
                                      0xA9, 0xA1, 0x12, 0x41, 0x68, 0x38,
                                      0xDB, 0xE5, 0x72, 0x77};
-
-static uint16_t midi_handle_table[4]; // Handle storage
 
 static esp_gatt_char_prop_t midi_property = 0;
 
 static int conn_id = -1;
 static uint16_t midi_interface = 0;
 static bool is_connected = false;
+static bool notifications_enabled = false;
 
 static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event,
                                           esp_gatt_if_t gatts_if,
@@ -72,7 +70,7 @@ static esp_ble_adv_params_t adv_params = {
 
 static esp_ble_adv_data_t adv_data = {
     .set_scan_rsp = false,
-    .include_name = false, // Name moved to scan response to save space
+    .include_name = false,
     .include_txpower = true,
     .min_interval = 0x0006,
     .max_interval = 0x0010,
@@ -106,11 +104,9 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event,
                               esp_ble_gap_cb_param_t *param) {
   switch (event) {
   case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
-    // After main adv data is set, configure scan response
     esp_ble_gap_config_adv_data(&scan_rsp_data);
     break;
   case ESP_GAP_BLE_SCAN_RSP_DATA_SET_COMPLETE_EVT:
-    // After scan response is set, start advertising
     esp_ble_gap_start_advertising(&adv_params);
     break;
   case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
@@ -128,8 +124,8 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event,
                                           esp_ble_gatts_cb_param_t *param) {
   switch (event) {
   case ESP_GATTS_REG_EVT:
-    ESP_LOGI(TAG, "REGISTER_APP_EVT, status %d, app_id %d", param->reg.status,
-             param->reg.app_id);
+    // ESP_LOGI(TAG, "GATTS Register Event: status %d, app_id %d",
+    //          param->reg.status, param->reg.app_id);
     gl_profile_tab[PROFILE_APP_ID].service_id.is_primary = true;
     gl_profile_tab[PROFILE_APP_ID].service_id.id.inst_id = 0x00;
     gl_profile_tab[PROFILE_APP_ID].service_id.id.uuid.len = ESP_UUID_LEN_128;
@@ -143,8 +139,9 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event,
                                  &gl_profile_tab[PROFILE_APP_ID].service_id, 4);
     break;
   case ESP_GATTS_CREATE_EVT:
-    ESP_LOGI(TAG, "CREATE_SERVICE_EVT, status %d,  service_handle %d",
-             param->create.status, param->create.service_handle);
+    // ESP_LOGI(TAG, "Create Service: status %d, handle %d",
+    // param->create.status,
+    //          param->create.service_handle);
     gl_profile_tab[PROFILE_APP_ID].service_handle =
         param->create.service_handle;
     gl_profile_tab[PROFILE_APP_ID].char_uuid.len = ESP_UUID_LEN_128;
@@ -164,7 +161,6 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event,
     gl_profile_tab[PROFILE_APP_ID].char_handle = param->add_char.attr_handle;
     midi_interface = gatts_if;
 
-    // Add descriptor for notifications (CCCD)
     gl_profile_tab[PROFILE_APP_ID].descr_uuid.len = ESP_UUID_LEN_16;
     gl_profile_tab[PROFILE_APP_ID].descr_uuid.uuid.uuid16 =
         ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
@@ -177,22 +173,27 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event,
   case ESP_GATTS_CONNECT_EVT:
     conn_id = param->connect.conn_id;
     is_connected = true;
-    ESP_LOGI(TAG, "Connected, conn_id %d", conn_id);
+    ESP_LOGI(TAG, "BLE Connected (ID: %d)", conn_id);
     break;
   case ESP_GATTS_DISCONNECT_EVT:
     is_connected = false;
-    ESP_LOGI(TAG, "Disconnected");
+    ESP_LOGI(TAG, "BLE Disconnected");
     esp_ble_gap_start_advertising(&adv_params);
     break;
   case ESP_GATTS_WRITE_EVT:
-    // Handle incoming MIDI data if needed
-    ESP_LOGI(TAG, "Write event");
-    if (param->write.is_prep) {
-      // prepare write
-    } else {
-      // write
-      // print data
-      ESP_LOG_BUFFER_HEX(TAG, param->write.value, param->write.len);
+    // ESP_LOGI(TAG, "BLE Write Event received");
+    if (!param->write.is_prep) {
+      // Check if client is enabling/disabling notifications
+      if (param->write.len == 2 && param->write.value[0] == 0x01 &&
+          param->write.value[1] == 0x00) {
+        notifications_enabled = true;
+        ESP_LOGI(TAG, "Client ENABLED notifications - MIDI ready!");
+      } else if (param->write.len == 2 && param->write.value[0] == 0x00 &&
+                 param->write.value[1] == 0x00) {
+        notifications_enabled = false;
+        ESP_LOGW(TAG, "Client DISABLED notifications");
+      }
+      // ESP_LOG_BUFFER_HEX(TAG, param->write.value, param->write.len);
     }
     break;
   default:
@@ -273,11 +274,23 @@ void ble_midi_init(void) {
 }
 
 int ble_midi_send_packet(uint8_t *midi_packet, size_t len) {
-  if (is_connected) {
-    esp_ble_gatts_send_indicate(
-        midi_interface, conn_id, gl_profile_tab[PROFILE_APP_ID].char_handle,
-        len, midi_packet, false); // false = notification, true = indication
-    return 0;
+  if (!is_connected) {
+    ESP_LOGW(TAG, "MIDI NOT SENT - No BLE connection!");
+    return -1;
   }
-  return -1;
+
+  if (!notifications_enabled) {
+    ESP_LOGW(TAG, "MIDI NOT SENT - Notifications not enabled!");
+    return -1;
+  }
+
+  esp_ble_gatts_send_indicate(midi_interface, conn_id,
+                              gl_profile_tab[PROFILE_APP_ID].char_handle, len,
+                              midi_packet, false);
+  if (len == 6) {
+    ESP_LOGI(TAG, "MIDI Sent: [%02X %02X %02X %02X %02X %02X]", midi_packet[0],
+             midi_packet[1], midi_packet[2], midi_packet[3], midi_packet[4],
+             midi_packet[5]);
+  }
+  return 0;
 }
