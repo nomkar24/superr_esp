@@ -38,7 +38,7 @@ static const char *TAG = "velocity_matrix";
 #define COL1_GPIO 4
 #define COL2_GPIO 5
 #define COL3_GPIO 6
-#define COL4_GPIO 7
+#define COL4_GPIO 15
 
 // Matrix 1 Rows (S1 - First Contact) (OUTPUT)
 #define M1_ROW1_GPIO 16
@@ -54,7 +54,7 @@ static const char *TAG = "velocity_matrix";
 #define M2_ROW3_GPIO 37
 #define M2_ROW4_GPIO 38
 #define M2_ROW5_GPIO 39
-#define M2_ROW6_GPIO 41
+#define M2_ROW6_GPIO 45
 
 // Velocity Calculation Config
 #define MIN_TIME_US 2000           // 2ms (Max Velocity 127)
@@ -62,7 +62,9 @@ static const char *TAG = "velocity_matrix";
 #define VELOCITY_TIMEOUT_US 500000 // 500ms timeout for stuck timers
 
 // Debounce Configuration
-#define DEBOUNCE_COUNT_THRESHOLD 2 // Number of consistent reads required
+// Debounce Configuration
+#define DEBOUNCE_TIME_US 5000 // 5ms lockout
+#define SCAN_INTERVAL_US 50   // Target 20kHz scan rate
 
 // LED Configuration
 #define LED_VELOCITY_SCALE 2
@@ -75,7 +77,11 @@ typedef struct {
   bool key_pressed;
   uint8_t velocity;
   uint8_t midi_note;
-  uint8_t debounce_count; // Debounce counter
+  // Debounce State
+  bool s1_stable;
+  bool sa_stable;
+  int64_t s1_last_change;
+  int64_t sa_last_change;
 } KeyState;
 
 typedef struct {
@@ -140,97 +146,139 @@ static int send_midi_note(uint8_t note, uint8_t velocity, bool note_on) {
   return ble_midi_send(midi_packet, len);
 }
 
-static void process_key_logic(int key_index, bool s1_active, bool sa_active) {
+static const char *get_note_name(uint8_t note) {
+  static const char *note_names[] = {"C",  "C#", "D",  "D#", "E",  "F",
+                                     "F#", "G",  "G#", "A",  "A#", "B"};
+  return note_names[note % 12];
+}
+
+static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
   KeyState *key = &keys[key_index];
+  int64_t now = esp_timer_get_time();
 
-  // Debouncing: Track contact state changes
-  static bool prev_s1[NUM_KEYS] = {false};
-  static bool prev_sa[NUM_KEYS] = {false};
+  // --- S1 Debounce (Eager) ---
+  if (s1_raw != key->s1_stable) {
+    if ((now - key->s1_last_change) > DEBOUNCE_TIME_US) {
+      key->s1_stable = s1_raw;
+      key->s1_last_change = now;
 
-  // Only process if state is stable (debounced)
-  bool s1_stable = (s1_active == prev_s1[key_index]);
-  bool sa_stable = (sa_active == prev_sa[key_index]);
-
-  prev_s1[key_index] = s1_active;
-  prev_sa[key_index] = sa_active;
-
-  // 1. S1 Activation (Start Timer) - only if debounced
-  if (s1_active && s1_stable && !key->timer_running && !key->key_pressed) {
-    key->start_time = esp_timer_get_time();
-    key->timer_running = true;
-    // Log S1 Contact time
-    ESP_LOGI(TAG, "Key %d: S1 (First Contact) detected at %lld us", key_index,
-             key->start_time);
-  }
-
-  // 2. SA Activation (Trigger Note) - only if debounced
-  if (sa_active && sa_stable && key->timer_running && !key->key_pressed) {
-    int64_t end_time = esp_timer_get_time();
-    int64_t delta_us = end_time - key->start_time;
-
-    key->timer_running = false;
-    key->key_pressed = true;
-    key->velocity = calculate_velocity(delta_us);
-
-    // Log SA Contact time and calculated delta
-    ESP_LOGI(TAG,
-             "Key %d: SA (Second Contact) detected at %lld us | Delta: %lld us "
-             "| Velocity: %d",
-             key_index, esp_timer_get_time(), delta_us, key->velocity);
-
-    if (key_index < LED_STRIP_LED_NUMBERS) {
-      led_strip_set_pixel(led_strip, key_index,
-                          key->velocity * LED_VELOCITY_SCALE, 0, 0);
-      led_strip_refresh(led_strip);
-    }
-
-    // Send MIDI Note On message
-    send_midi_note(key->midi_note, key->velocity, true);
-  }
-
-  // 3. Fallback - SA without S1 (only if debounced)
-  if (sa_active && sa_stable && !key->timer_running && !key->key_pressed) {
-    key->key_pressed = true;
-    key->velocity = 127;
-    // ESP_LOGW(TAG, "Key %d: SA WITHOUT S1 (Fallback - Max Velocity)",
-    // key_index);
-
-    // Send MIDI Note On with max velocity
-    send_midi_note(key->midi_note, 127, true);
-
-    if (key_index < LED_STRIP_LED_NUMBERS) {
-      led_strip_set_pixel(led_strip, key_index, LED_MAX_BRIGHTNESS, 0, 0);
-      led_strip_refresh(led_strip);
+      // S1 Rising Edge
+      if (key->s1_stable && !key->timer_running && !key->key_pressed) {
+        key->start_time = now;
+        key->timer_running = true;
+        // Log S1 Contact
+        ESP_LOGI(TAG, "Key %d (%s%d): S1 (First Contact) detected", key_index,
+                 get_note_name(key->midi_note), (key->midi_note / 12) - 1);
+      }
+      // S1 Falling Edge (early release)
+      else if (!key->s1_stable && key->timer_running) {
+        key->timer_running = false;
+        ESP_LOGW(TAG, "Key %d (%s%d): S1 Released before SA (Aborted)",
+                 key_index, get_note_name(key->midi_note),
+                 (key->midi_note / 12) - 1);
+      }
     }
   }
 
-  // 4. Release (Note OFF)
-  if (!s1_active && !sa_active && key->key_pressed) {
+  // --- SA Debounce (Eager) ---
+  if (sa_raw != key->sa_stable) {
+    if ((now - key->sa_last_change) > DEBOUNCE_TIME_US) {
+      key->sa_stable = sa_raw;
+      key->sa_last_change = now;
+
+      // SA Rising Edge
+      if (key->sa_stable) {
+        // 1. Normal Strike (S1 -> SA)
+        if (key->timer_running && !key->key_pressed) {
+          int64_t delta_us = now - key->start_time;
+          key->timer_running = false;
+          key->key_pressed = true;
+          key->velocity = calculate_velocity(delta_us);
+
+          // Log SA Contact and Velocity
+          ESP_LOGI(TAG,
+                   "Key %d (%s%d): SA (Second Contact) detected | Delta: %lld "
+                   "us | Vel: %d",
+                   key_index, get_note_name(key->midi_note),
+                   (key->midi_note / 12) - 1, delta_us, key->velocity);
+
+          if (key_index < LED_STRIP_LED_NUMBERS) {
+            led_strip_set_pixel(led_strip, key_index,
+                                key->velocity * LED_VELOCITY_SCALE, 0, 0);
+            led_strip_refresh(led_strip);
+          }
+          send_midi_note(key->midi_note, key->velocity, true);
+        }
+        // 2. Fallback (SA only)
+        else if (!key->key_pressed) {
+          key->key_pressed = true;
+          key->velocity = 127;
+
+          ESP_LOGW(TAG, "Key %d (%s%d): SA WITHOUT S1 (Fallback)", key_index,
+                   get_note_name(key->midi_note), (key->midi_note / 12) - 1);
+
+          send_midi_note(key->midi_note, 127, true);
+          if (key_index < LED_STRIP_LED_NUMBERS) {
+            led_strip_set_pixel(led_strip, key_index, LED_MAX_BRIGHTNESS, 0, 0);
+            led_strip_refresh(led_strip);
+          }
+        }
+      }
+    }
+  }
+
+  // Release Condition (Both Released)
+  if (!key->s1_stable && !key->sa_stable && key->key_pressed) {
     key->key_pressed = false;
-    ESP_LOGI(TAG, "Key %d: Released", key_index);
+    ESP_LOGI(TAG, "Key %d (%s%d): Released", key_index,
+             get_note_name(key->midi_note), (key->midi_note / 12) - 1);
 
     if (key_index < LED_STRIP_LED_NUMBERS) {
       led_strip_set_pixel(led_strip, key_index, LED_OFF, LED_OFF, LED_OFF);
       led_strip_refresh(led_strip);
     }
-
-    // Send MIDI Note Off message
     send_midi_note(key->midi_note, 0, false);
   }
 
-  // 5. Aborted Press
-  if (!s1_active && key->timer_running) {
+  // Timeout Check
+  if (key->timer_running && (now - key->start_time > VELOCITY_TIMEOUT_US)) {
     key->timer_running = false;
-    ESP_LOGW(TAG, "Key %d: S1 RELEASED before SA (Aborted press)", key_index);
+    ESP_LOGW(TAG, "Key %d (%s%d): Velocity Timeout", key_index,
+             get_note_name(key->midi_note), (key->midi_note / 12) - 1);
   }
+}
 
-  // 6. Timeout for stuck timers
-  if (key->timer_running) {
-    int64_t elapsed = esp_timer_get_time() - key->start_time;
-    if (elapsed > VELOCITY_TIMEOUT_US) {
-      key->timer_running = false;
-      // ESP_LOGW(TAG, "Key %d: Velocity timer TIMEOUT (%lld us)", key_index,
-      //          elapsed);
+// ... existing code ...
+
+static void scan_task(void *arg) {
+  ESP_LOGI(TAG, "Starting High-Speed Scan Task on Core 1");
+
+  while (1) {
+    int64_t loop_start = esp_timer_get_time();
+
+    for (int c = 0; c < COLS_PER_MATRIX; c++) {
+      // Drive Column HIGH
+      gpio_set_level(shared_cols[c], 1);
+      esp_rom_delay_us(10); // Settling time
+
+      for (int r = 0; r < ROWS_PER_MATRIX; r++) {
+        int key_index = (r * COLS_PER_MATRIX) + c;
+
+        // Read Rows
+        bool s1_active = gpio_get_level(matrices[0].row_gpios[r]);
+        bool sa_active = gpio_get_level(matrices[1].row_gpios[r]);
+
+        process_key_logic(key_index, s1_active, sa_active);
+      }
+
+      // Drive Column LOW
+      gpio_set_level(shared_cols[c], 0);
+    }
+
+    // Precise Delay for Loop Frequency
+    int64_t took = esp_timer_get_time() - loop_start;
+    if (took < SCAN_INTERVAL_US) {
+      esp_rom_delay_us(SCAN_INTERVAL_US - took);
     }
   }
 }
@@ -289,7 +337,10 @@ void app_main(void) {
     keys[i].key_pressed = false;
     keys[i].velocity = 0;
     keys[i].midi_note = piano_notes[i];
-    keys[i].debounce_count = 0;
+    keys[i].s1_stable = false;
+    keys[i].sa_stable = false;
+    keys[i].s1_last_change = 0;
+    keys[i].sa_last_change = 0;
   }
 
   uint64_t col_pin_mask = 0;
@@ -331,30 +382,12 @@ void app_main(void) {
 
   ESP_LOGI(TAG, "24-Key Velocity Matrix Initialized");
 
+  // Create HIGH Priority Task on Core 1
+  xTaskCreatePinnedToCore(scan_task, "scan_task", 4096, NULL,
+                          configMAX_PRIORITIES - 1, NULL, 1);
+
+  // Idle in main task or delete
   while (1) {
-    for (int c = 0; c < COLS_PER_MATRIX; c++) {
-      // Active-High: Drive column HIGH to scan
-      gpio_set_level(shared_cols[c], 1);
-      esp_rom_delay_us(10);
-
-      // Scan both matrices simultaneously for this column
-      for (int r = 0; r < ROWS_PER_MATRIX; r++) {
-        int key_index = (r * COLS_PER_MATRIX) + c;
-
-        // Read both S1 and SA contacts at once
-        int s1_level = gpio_get_level(matrices[0].row_gpios[r]);
-        int sa_level = gpio_get_level(matrices[1].row_gpios[r]);
-
-        // Active-High: Row reads HIGH when pressed
-        bool s1_active = (s1_level == 1);
-        bool sa_active = (sa_level == 1);
-
-        process_key_logic(key_index, s1_active, sa_active);
-      }
-
-      // Deactivate column (drive LOW)
-      gpio_set_level(shared_cols[c], 0);
-    }
-    vTaskDelay(pdMS_TO_TICKS(1));
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
