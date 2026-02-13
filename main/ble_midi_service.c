@@ -44,8 +44,8 @@ static void conn_params_timer_callback(void *arg) {
   if (is_connected && conn_id != -1) {
     esp_ble_conn_update_params_t conn_params = {0};
     memcpy(conn_params.bda, (esp_bd_addr_t *)arg, sizeof(esp_bd_addr_t));
-    conn_params.min_int = 0x0C; // 15ms (min interval = value * 1.25ms)
-    conn_params.max_int = 0x18; // 30ms (max interval = value * 1.25ms)
+    conn_params.min_int = 0x18; // 30ms (min interval = value * 1.25ms)
+    conn_params.max_int = 0x28; // 50ms (max interval = value * 1.25ms)
     conn_params.latency = 0;    // No slave latency
     conn_params.timeout = 400;  // 4000ms supervision timeout
 

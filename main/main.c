@@ -19,7 +19,10 @@
 #include "freertos/task.h"
 #include "led_strip.h"
 #include "nvs_flash.h"
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 static const char *TAG = "velocity_matrix";
 
@@ -27,6 +30,33 @@ static const char *TAG = "velocity_matrix";
 #define LED_STRIP_GPIO_PIN 10
 #define LED_STRIP_LED_NUMBERS 24
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
+
+// --- LED Animation System ---
+#define LED_FRAME_RATE_MS 16 // ~60 FPS
+#define LERP_FACTOR 0.5f     // 50% movement per frame (faster animation)
+
+// LED Event Types
+typedef enum { LED_EVENT_NOTE_ON, LED_EVENT_NOTE_OFF } led_event_type_t;
+
+typedef struct {
+  led_event_type_t type;
+  uint8_t key_index;
+  uint8_t velocity;
+} led_event_t;
+
+// RGB Color Structure
+typedef struct {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+} rgb_color_t;
+
+// LED Themes
+typedef enum {
+  LED_THEME_AURORA, // Velocity-based rainbow gradient
+  LED_THEME_FIRE,   // Red/Orange/Yellow heat map
+  LED_THEME_MATRIX  // Green cascade effect
+} led_theme_t;
 
 // --- Matrix Configuration ---
 #define NUM_MATRICES 2
@@ -57,37 +87,45 @@ static const char *TAG = "velocity_matrix";
 #define M2_ROW6_GPIO 45
 
 // Velocity Calculation Config
-#define MIN_TIME_US 2000           // 2ms (Max Velocity 127)
-#define MAX_TIME_US 200000         // 200ms (Min Velocity 1)
-#define VELOCITY_TIMEOUT_US 500000 // 500ms timeout for stuck timers
+#define MIN_TIME_US 2000            // 2ms (Max Velocity 127)
+#define MAX_TIME_US 200000          // 200ms (Min Velocity 1)
+#define VELOCITY_TIMEOUT_US 2000000 // 2s timeout for slow presses
 
 // Debounce Configuration
-// Debounce Configuration
-#define DEBOUNCE_TIME_US 5000 // 5ms lockout
-#define SCAN_INTERVAL_US 50   // Target 20kHz scan rate
+#define DEBOUNCE_TIME_US 20000 // 20ms lockout (increased to prevent bounce)
+#define SCAN_INTERVAL_US 50    // Target 20kHz scan rate
 
 // LED Configuration
 #define LED_VELOCITY_SCALE 2
-#define LED_MAX_BRIGHTNESS 200
+#define LED_MAX_BRIGHTNESS 100 // Increased for better visibility
 #define LED_OFF 0
 
-typedef struct {
-  int64_t start_time;
-  bool timer_running;
-  bool key_pressed;
-  uint8_t velocity;
-  uint8_t midi_note;
-  // Debounce State
-  bool s1_stable;
-  bool sa_stable;
-  int64_t s1_last_change;
-  int64_t sa_last_change;
-} KeyState;
+#define VELOCITY_CURVE 2.0
+
+// LED Animation System Globals
+static QueueHandle_t led_msgq;
+static rgb_color_t pixels[LED_STRIP_LED_NUMBERS];        // Current displayed
+static rgb_color_t target_pixels[LED_STRIP_LED_NUMBERS]; // Target colors
+static led_theme_t current_theme = LED_THEME_AURORA;
 
 typedef struct {
   gpio_num_t col_gpios[COLS_PER_MATRIX];
   gpio_num_t row_gpios[ROWS_PER_MATRIX];
 } MatrixConfig;
+
+typedef struct {
+  int midi_note;
+  int64_t start_time;
+  int64_t s1_last_change;
+  int64_t sa_last_change;
+  int64_t sa_release_time;
+  bool s1_stable;
+  bool sa_stable;
+  bool timer_running;
+  bool key_pressed;
+  int velocity;
+  int release_velocity;
+} KeyState;
 
 static KeyState keys[NUM_KEYS];
 static led_strip_handle_t led_strip;
@@ -110,46 +148,130 @@ static const MatrixConfig matrices[NUM_MATRICES] = {
     },
 };
 
-static int calculate_velocity(int64_t delta_us) {
-  if (delta_us <= MIN_TIME_US) {
-    return 127;
-  } else if (delta_us >= MAX_TIME_US) {
-    return 1;
-  } else {
-    return 127 - ((delta_us - MIN_TIME_US) * 126 / (MAX_TIME_US - MIN_TIME_US));
+static const char *note_names[] = {"C",  "C#", "D",  "D#", "E",  "F",
+                                   "F#", "G",  "G#", "A",  "A#", "B"};
+
+static const char *get_note_name(int note) { return note_names[note % 12]; }
+
+// --- LED Animation Helper Functions ---
+
+// Linear interpolation for smooth color transitions
+static uint8_t lerp_u8(uint8_t current, uint8_t target, float factor) {
+  // If very close to target, snap to it (prevents floating-point rounding
+  // issues)
+  if (abs((int)current - (int)target) <= 3) {
+    return target;
   }
+  return (uint8_t)(current + (target - current) * factor);
 }
 
-/**
- * @brief Send a MIDI note message over BLE using helper functions
- *
- * @param note MIDI note number (0-127)
- * @param velocity Note velocity (0-127, 0 = note off)
- * @param note_on true for Note On, false for Note Off
- * @return int 0 on success, negative on error
- */
+static void lerp_color(rgb_color_t *current, const rgb_color_t *target) {
+  current->r = lerp_u8(current->r, target->r, LERP_FACTOR);
+  current->g = lerp_u8(current->g, target->g, LERP_FACTOR);
+  current->b = lerp_u8(current->b, target->b, LERP_FACTOR);
+}
+
+// Aurora Theme: Velocity-based rainbow gradient (HSV-like)
+static rgb_color_t theme_aurora_color(uint8_t velocity) {
+  rgb_color_t color = {0, 0, 0};
+
+  // Map velocity to hue (0-127 -> 0-360 degrees)
+  float hue = (velocity / 127.0f) * 360.0f;
+  float brightness = (velocity / 127.0f) * LED_MAX_BRIGHTNESS;
+
+  if (hue < 60) {
+    // Red to Yellow
+    color.r = (uint8_t)brightness;
+    color.g = (uint8_t)((hue / 60.0f) * brightness);
+  } else if (hue < 120) {
+    // Yellow to Green
+    color.r = (uint8_t)(((120 - hue) / 60.0f) * brightness);
+    color.g = (uint8_t)brightness;
+  } else if (hue < 180) {
+    // Green to Cyan
+    color.g = (uint8_t)brightness;
+    color.b = (uint8_t)(((hue - 120) / 60.0f) * brightness);
+  } else if (hue < 240) {
+    // Cyan to Blue
+    color.g = (uint8_t)(((240 - hue) / 60.0f) * brightness);
+    color.b = (uint8_t)brightness;
+  } else if (hue < 300) {
+    // Blue to Magenta
+    color.r = (uint8_t)(((hue - 240) / 60.0f) * brightness);
+    color.b = (uint8_t)brightness;
+  } else {
+    // Magenta to Red
+    color.r = (uint8_t)brightness;
+    color.b = (uint8_t)(((360 - hue) / 60.0f) * brightness);
+  }
+
+  return color;
+}
+
+// Fire Theme: Red/Orange/Yellow heat map
+static rgb_color_t theme_fire_color(uint8_t velocity) {
+  rgb_color_t color = {0, 0, 0};
+  float intensity = (velocity / 127.0f);
+
+  if (velocity < 42) {
+    // Dark red to red
+    color.r = (uint8_t)(intensity * LED_MAX_BRIGHTNESS * 3.0f);
+  } else if (velocity < 85) {
+    // Red to orange
+    color.r = LED_MAX_BRIGHTNESS;
+    color.g = (uint8_t)((intensity - 0.33f) * LED_MAX_BRIGHTNESS * 1.5f);
+  } else {
+    // Orange to yellow/white
+    color.r = LED_MAX_BRIGHTNESS;
+    color.g = LED_MAX_BRIGHTNESS;
+    color.b = (uint8_t)((intensity - 0.67f) * LED_MAX_BRIGHTNESS * 3.0f);
+  }
+
+  return color;
+}
+
+// Matrix Theme: Green cascade effect
+static rgb_color_t theme_matrix_color(uint8_t velocity) {
+  rgb_color_t color = {0, 0, 0};
+  float intensity = (velocity / 127.0f);
+
+  color.g = (uint8_t)(intensity * LED_MAX_BRIGHTNESS);
+
+  return color;
+}
+
+// Function to calculate velocity from time delta (us)
+static uint8_t calculate_velocity(int64_t delta_us) {
+  if (delta_us < MIN_TIME_US)
+    return 127;
+  if (delta_us > MAX_TIME_US)
+    return 1;
+
+  float normalized = 1.0f - ((float)(delta_us - MIN_TIME_US) /
+                             (float)(MAX_TIME_US - MIN_TIME_US));
+  float curved = powf(normalized, VELOCITY_CURVE);
+  int velocity = (int)(curved * 126.0f) + 1;
+
+  if (velocity > 127)
+    velocity = 127;
+  if (velocity < 1)
+    velocity = 1;
+
+  return (uint8_t)velocity;
+}
+
 static int send_midi_note(uint8_t note, uint8_t velocity, bool note_on) {
   uint8_t midi_packet[5];
   int len;
-
   if (note_on) {
     len = ble_midi_note_on(note, velocity, 0, midi_packet, sizeof(midi_packet));
   } else {
     len =
         ble_midi_note_off(note, velocity, 0, midi_packet, sizeof(midi_packet));
   }
-
-  if (len < 0) {
-    return len; // Error from helper function
-  }
-
+  if (len < 0)
+    return len;
   return ble_midi_send(midi_packet, len);
-}
-
-static const char *get_note_name(uint8_t note) {
-  static const char *note_names[] = {"C",  "C#", "D",  "D#", "E",  "F",
-                                     "F#", "G",  "G#", "A",  "A#", "B"};
-  return note_names[note % 12];
 }
 
 static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
@@ -166,16 +288,35 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
       if (key->s1_stable && !key->timer_running && !key->key_pressed) {
         key->start_time = now;
         key->timer_running = true;
-        // Log S1 Contact
         ESP_LOGI(TAG, "Key %d (%s%d): S1 (First Contact) detected", key_index,
                  get_note_name(key->midi_note), (key->midi_note / 12) - 1);
       }
-      // S1 Falling Edge (early release)
-      else if (!key->s1_stable && key->timer_running) {
-        key->timer_running = false;
-        ESP_LOGW(TAG, "Key %d (%s%d): S1 Released before SA (Aborted)",
-                 key_index, get_note_name(key->midi_note),
-                 (key->midi_note / 12) - 1);
+      // S1 Falling Edge (Release Complete)
+      else if (!key->s1_stable) {
+        if (key->key_pressed) {
+          int64_t release_delta = now - key->sa_release_time;
+          int release_vel = calculate_velocity(release_delta);
+
+          ESP_LOGI(TAG, "Key %d (%s%d): Released | Delta: %lld us | RelVel: %d",
+                   key_index, get_note_name(key->midi_note),
+                   (key->midi_note / 12) - 1, (long long)release_delta,
+                   release_vel);
+
+          // Send LED event
+          led_event_t led_event = {.type = LED_EVENT_NOTE_OFF,
+                                   .key_index = key_index,
+                                   .velocity = 0};
+          xQueueSend(led_msgq, &led_event, 0);
+
+          send_midi_note(key->midi_note, release_vel, false);
+
+          key->key_pressed = false;
+        } else if (key->timer_running) {
+          key->timer_running = false;
+          ESP_LOGW(TAG, "Key %d (%s%d): S1 Released before SA (Aborted)",
+                   key_index, get_note_name(key->midi_note),
+                   (key->midi_note / 12) - 1);
+        }
       }
     }
   }
@@ -195,18 +336,18 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
           key->key_pressed = true;
           key->velocity = calculate_velocity(delta_us);
 
-          // Log SA Contact and Velocity
           ESP_LOGI(TAG,
                    "Key %d (%s%d): SA (Second Contact) detected | Delta: %lld "
                    "us | Vel: %d",
                    key_index, get_note_name(key->midi_note),
                    (key->midi_note / 12) - 1, delta_us, key->velocity);
 
-          if (key_index < LED_STRIP_LED_NUMBERS) {
-            led_strip_set_pixel(led_strip, key_index,
-                                key->velocity * LED_VELOCITY_SCALE, 0, 0);
-            led_strip_refresh(led_strip);
-          }
+          // Send LED event
+          led_event_t led_event = {.type = LED_EVENT_NOTE_ON,
+                                   .key_index = key_index,
+                                   .velocity = key->velocity};
+          xQueueSend(led_msgq, &led_event, 0);
+
           send_midi_note(key->midi_note, key->velocity, true);
         }
         // 2. Fallback (SA only)
@@ -217,27 +358,20 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
           ESP_LOGW(TAG, "Key %d (%s%d): SA WITHOUT S1 (Fallback)", key_index,
                    get_note_name(key->midi_note), (key->midi_note / 12) - 1);
 
+          // Don't send LED event for fallback - prevents bounce-triggered stuck
+          // LEDs led_event_t led_event = {.type = LED_EVENT_NOTE_ON,
+          //                          .key_index = key_index,
+          //                          .velocity = 127};
+          // xQueueSend(led_msgq, &led_event, 0);
+
           send_midi_note(key->midi_note, 127, true);
-          if (key_index < LED_STRIP_LED_NUMBERS) {
-            led_strip_set_pixel(led_strip, key_index, LED_MAX_BRIGHTNESS, 0, 0);
-            led_strip_refresh(led_strip);
-          }
         }
       }
+      // SA Falling Edge (Start of Release)
+      else if (!key->sa_stable) {
+        key->sa_release_time = now;
+      }
     }
-  }
-
-  // Release Condition (Both Released)
-  if (!key->s1_stable && !key->sa_stable && key->key_pressed) {
-    key->key_pressed = false;
-    ESP_LOGI(TAG, "Key %d (%s%d): Released", key_index,
-             get_note_name(key->midi_note), (key->midi_note / 12) - 1);
-
-    if (key_index < LED_STRIP_LED_NUMBERS) {
-      led_strip_set_pixel(led_strip, key_index, LED_OFF, LED_OFF, LED_OFF);
-      led_strip_refresh(led_strip);
-    }
-    send_midi_note(key->midi_note, 0, false);
   }
 
   // Timeout Check
@@ -248,7 +382,54 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
   }
 }
 
-// ... existing code ...
+// LED Thread - Runs at 60 FPS on Core 0
+static void led_thread_entry(void *arg) {
+  ESP_LOGI(TAG, "LED Animation Thread started @ 60 FPS on Core 0");
+
+  TickType_t last_wake_time = xTaskGetTickCount();
+  const TickType_t frame_delay = pdMS_TO_TICKS(LED_FRAME_RATE_MS);
+
+  while (1) {
+    // Phase 1: Process incoming events from queue
+    led_event_t event;
+    while (xQueueReceive(led_msgq, &event, 0) == pdTRUE) {
+      if (event.key_index >= LED_STRIP_LED_NUMBERS)
+        continue;
+
+      if (event.type == LED_EVENT_NOTE_ON) {
+        // Calculate target color based on current theme
+        switch (current_theme) {
+        case LED_THEME_AURORA:
+          target_pixels[event.key_index] = theme_aurora_color(event.velocity);
+          break;
+        case LED_THEME_FIRE:
+          target_pixels[event.key_index] = theme_fire_color(event.velocity);
+          break;
+        case LED_THEME_MATRIX:
+          target_pixels[event.key_index] = theme_matrix_color(event.velocity);
+          break;
+        }
+      } else {
+        // Note OFF - fade to black
+        target_pixels[event.key_index] = (rgb_color_t){0, 0, 0};
+      }
+    }
+
+    // Phase 2: Animation - Lerp current toward target
+    for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
+      lerp_color(&pixels[i], &target_pixels[i]);
+    }
+
+    // Phase 3: Render to hardware
+    for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
+      led_strip_set_pixel(led_strip, i, pixels[i].r, pixels[i].g, pixels[i].b);
+    }
+    led_strip_refresh(led_strip);
+
+    // Phase 4: Maintain 60 FPS timing
+    vTaskDelayUntil(&last_wake_time, frame_delay);
+  }
+}
 
 static void scan_task(void *arg) {
   ESP_LOGI(TAG, "Starting High-Speed Scan Task on Core 1");
@@ -319,6 +500,23 @@ void app_main(void) {
       led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
   ESP_LOGI(TAG, "LED Strip initialized on GPIO %d", LED_STRIP_GPIO_PIN);
 
+  // Initialize LED Animation System
+  led_msgq = xQueueCreate(32, sizeof(led_event_t));
+  if (led_msgq == NULL) {
+    ESP_LOGE(TAG, "Failed to create LED message queue");
+  } else {
+    ESP_LOGI(TAG, "LED message queue created (32 events)");
+  }
+
+  // Initialize pixel buffers to black
+  memset(pixels, 0, sizeof(pixels));
+  memset(target_pixels, 0, sizeof(target_pixels));
+
+  // Create LED animation thread on Core 0 (separate from scan on Core 1)
+  xTaskCreatePinnedToCore(led_thread_entry, "led_thread", 4096, NULL, 3, NULL,
+                          0);
+  ESP_LOGI(TAG, "LED animation thread created on Core 0");
+
   // Initialize key states with standard piano layout (C4 to B5)
   // Keys are arranged in 6 rows × 4 columns, mapped left-to-right,
   // bottom-to-top
@@ -341,6 +539,17 @@ void app_main(void) {
     keys[i].sa_stable = false;
     keys[i].s1_last_change = 0;
     keys[i].sa_last_change = 0;
+    keys[i].sa_release_time = 0;
+  }
+
+  // Reset all pins to clear any default JTAG/Boot functions
+  for (int c = 0; c < COLS_PER_MATRIX; c++) {
+    gpio_reset_pin(shared_cols[c]);
+  }
+  for (int m = 0; m < NUM_MATRICES; m++) {
+    for (int r = 0; r < ROWS_PER_MATRIX; r++) {
+      gpio_reset_pin(matrices[m].row_gpios[r]);
+    }
   }
 
   uint64_t col_pin_mask = 0;
@@ -383,8 +592,7 @@ void app_main(void) {
   ESP_LOGI(TAG, "24-Key Velocity Matrix Initialized");
 
   // Create HIGH Priority Task on Core 1
-  xTaskCreatePinnedToCore(scan_task, "scan_task", 4096, NULL,
-                          configMAX_PRIORITIES - 1, NULL, 1);
+  xTaskCreatePinnedToCore(scan_task, "scan_task", 4096, NULL, 5, NULL, 1);
 
   // Idle in main task or delete
   while (1) {
