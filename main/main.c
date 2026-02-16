@@ -10,8 +10,8 @@
  * - Velocity derived from time difference between S1 and SA contacts.
  */
 
-#include "ble_config_service.h"
-#include "ble_midi_service.h"
+// BLE config service removed - simplified to MIDI only
+#include "blemidi.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -106,7 +106,7 @@ typedef enum {
 static QueueHandle_t led_msgq;
 static rgb_color_t pixels[LED_STRIP_LED_NUMBERS];        // Current displayed
 static rgb_color_t target_pixels[LED_STRIP_LED_NUMBERS]; // Target colors
-static led_theme_t current_theme = LED_THEME_AURORA;
+// Note: current_theme is now controlled by g_led_theme from BLE config
 
 typedef struct {
   gpio_num_t col_gpios[COLS_PER_MATRIX];
@@ -153,6 +153,18 @@ static const char *note_names[] = {"C",  "C#", "D",  "D#", "E",  "F",
 
 static const char *get_note_name(int note) { return note_names[note % 12]; }
 
+// BLE MIDI receive callback (optional - for handling incoming MIDI)
+void callback_midi_message_received(uint8_t blemidi_port, uint16_t timestamp,
+                                    uint8_t midi_status,
+                                    uint8_t *remaining_message, size_t len) {
+  // Handle incoming MIDI if needed (e.g., for configuration)
+  ESP_LOGI(TAG, "MIDI RX: port=%d, status=0x%02x, len=%zu", blemidi_port,
+           midi_status, len);
+}
+
+// BLE MIDI tick timer callback - called every 1ms to flush output buffer
+static void blemidi_tick_timer_callback(void *arg) { blemidi_tick(); }
+
 // --- LED Animation Helper Functions ---
 
 // Linear interpolation for smooth color transitions
@@ -171,71 +183,16 @@ static void lerp_color(rgb_color_t *current, const rgb_color_t *target) {
   current->b = lerp_u8(current->b, target->b, LERP_FACTOR);
 }
 
-// Aurora Theme: Velocity-based rainbow gradient (HSV-like)
-static rgb_color_t theme_aurora_color(uint8_t velocity) {
-  rgb_color_t color = {0, 0, 0};
-
-  // Map velocity to hue (0-127 -> 0-360 degrees)
-  float hue = (velocity / 127.0f) * 360.0f;
-  float brightness = (velocity / 127.0f) * LED_MAX_BRIGHTNESS;
-
-  if (hue < 60) {
-    // Red to Yellow
-    color.r = (uint8_t)brightness;
-    color.g = (uint8_t)((hue / 60.0f) * brightness);
-  } else if (hue < 120) {
-    // Yellow to Green
-    color.r = (uint8_t)(((120 - hue) / 60.0f) * brightness);
-    color.g = (uint8_t)brightness;
-  } else if (hue < 180) {
-    // Green to Cyan
-    color.g = (uint8_t)brightness;
-    color.b = (uint8_t)(((hue - 120) / 60.0f) * brightness);
-  } else if (hue < 240) {
-    // Cyan to Blue
-    color.g = (uint8_t)(((240 - hue) / 60.0f) * brightness);
-    color.b = (uint8_t)brightness;
-  } else if (hue < 300) {
-    // Blue to Magenta
-    color.r = (uint8_t)(((hue - 240) / 60.0f) * brightness);
-    color.b = (uint8_t)brightness;
-  } else {
-    // Magenta to Red
-    color.r = (uint8_t)brightness;
-    color.b = (uint8_t)(((360 - hue) / 60.0f) * brightness);
-  }
-
-  return color;
-}
-
-// Fire Theme: Red/Orange/Yellow heat map
-static rgb_color_t theme_fire_color(uint8_t velocity) {
+// Simple velocity-based color (white gradient)
+static rgb_color_t get_led_color(uint8_t velocity) {
   rgb_color_t color = {0, 0, 0};
   float intensity = (velocity / 127.0f);
+  uint8_t brightness = (uint8_t)(intensity * LED_MAX_BRIGHTNESS);
 
-  if (velocity < 42) {
-    // Dark red to red
-    color.r = (uint8_t)(intensity * LED_MAX_BRIGHTNESS * 3.0f);
-  } else if (velocity < 85) {
-    // Red to orange
-    color.r = LED_MAX_BRIGHTNESS;
-    color.g = (uint8_t)((intensity - 0.33f) * LED_MAX_BRIGHTNESS * 1.5f);
-  } else {
-    // Orange to yellow/white
-    color.r = LED_MAX_BRIGHTNESS;
-    color.g = LED_MAX_BRIGHTNESS;
-    color.b = (uint8_t)((intensity - 0.67f) * LED_MAX_BRIGHTNESS * 3.0f);
-  }
-
-  return color;
-}
-
-// Matrix Theme: Green cascade effect
-static rgb_color_t theme_matrix_color(uint8_t velocity) {
-  rgb_color_t color = {0, 0, 0};
-  float intensity = (velocity / 127.0f);
-
-  color.g = (uint8_t)(intensity * LED_MAX_BRIGHTNESS);
+  // White gradient based on velocity
+  color.r = brightness;
+  color.g = brightness;
+  color.b = brightness;
 
   return color;
 }
@@ -252,6 +209,8 @@ static uint8_t calculate_velocity(int64_t delta_us) {
   float curved = powf(normalized, VELOCITY_CURVE);
   int velocity = (int)(curved * 126.0f) + 1;
 
+  // No sensitivity scaling - removed for simplicity
+
   if (velocity > 127)
     velocity = 127;
   if (velocity < 1)
@@ -260,18 +219,23 @@ static uint8_t calculate_velocity(int64_t delta_us) {
   return (uint8_t)velocity;
 }
 
+// BLE MIDI tick timer
+static esp_timer_handle_t blemidi_tick_timer = NULL;
+
 static int send_midi_note(uint8_t note, uint8_t velocity, bool note_on) {
-  uint8_t midi_packet[5];
-  int len;
-  if (note_on) {
-    len = ble_midi_note_on(note, velocity, 0, midi_packet, sizeof(midi_packet));
-  } else {
-    len =
-        ble_midi_note_off(note, velocity, 0, midi_packet, sizeof(midi_packet));
+  // Create MIDI message (3 bytes: status, note, velocity)
+  uint8_t message[3];
+  message[0] = note_on ? 0x90 : 0x80; // Note On/Off on channel 0
+  message[1] = note & 0x7F;
+  message[2] = velocity & 0x7F;
+
+  // Send via blemidi library (returns < 0 if not connected)
+  int result = blemidi_send_message(0, message, sizeof(message));
+  if (result < 0) {
+    // Silently ignore - not connected yet or connection lost
+    return 0;
   }
-  if (len < 0)
-    return len;
-  return ble_midi_send(midi_packet, len);
+  return result;
 }
 
 static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
@@ -397,18 +361,8 @@ static void led_thread_entry(void *arg) {
         continue;
 
       if (event.type == LED_EVENT_NOTE_ON) {
-        // Calculate target color based on current theme
-        switch (current_theme) {
-        case LED_THEME_AURORA:
-          target_pixels[event.key_index] = theme_aurora_color(event.velocity);
-          break;
-        case LED_THEME_FIRE:
-          target_pixels[event.key_index] = theme_fire_color(event.velocity);
-          break;
-        case LED_THEME_MATRIX:
-          target_pixels[event.key_index] = theme_matrix_color(event.velocity);
-          break;
-        }
+        // Calculate target color - simple white gradient based on velocity
+        target_pixels[event.key_index] = get_led_color(event.velocity);
       } else {
         // Note OFF - fade to black
         target_pixels[event.key_index] = (rgb_color_t){0, 0, 0};
@@ -473,12 +427,38 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
 
-  // Initialize BLE MIDI
-  ret = ble_midi_init();
-  if (ret != 0) {
-    ESP_LOGE(TAG, "BLE MIDI initialization failed: %d", ret);
+  // Initialize BLE MIDI using library
+  ESP_LOGI(TAG, "Initializing BLE MIDI library...");
+  int status = blemidi_init(callback_midi_message_received);
+  ESP_LOGI(TAG, "blemidi_init() returned: %d", status);
+
+  if (status < 0) {
+    ESP_LOGE(TAG, "BLE MIDI initialization failed: %d", status);
+    ESP_LOGE(TAG, "CRITICAL: BLE MIDI will not work!");
     // Continue anyway - keyboard will work without BLE
+  } else {
+    ESP_LOGI(TAG, "BLE MIDI initialized successfully");
+    ESP_LOGI(TAG, "Device should be advertising as: Superr_MIDI");
+
+    // Create timer to call blemidi_tick() every 1ms
+    esp_timer_create_args_t blemidi_tick_args = {
+        .callback = &blemidi_tick_timer_callback,
+        .arg = NULL,
+        .name = "blemidi_tick"};
+    ret = esp_timer_create(&blemidi_tick_args, &blemidi_tick_timer);
+    if (ret == ESP_OK) {
+      ret = esp_timer_start_periodic(blemidi_tick_timer, 1000); // 1ms = 1000us
+      if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "BLE MIDI tick timer started (1ms interval)");
+      } else {
+        ESP_LOGE(TAG, "Failed to start BLE MIDI tick timer: %d", ret);
+      }
+    } else {
+      ESP_LOGE(TAG, "Failed to create BLE MIDI tick timer: %d", ret);
+    }
   }
+
+  // BLE Config Service removed - simplified to MIDI only
 
   led_strip_config_t strip_config = {
       .strip_gpio_num = LED_STRIP_GPIO_PIN,
@@ -500,13 +480,13 @@ void app_main(void) {
       led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
   ESP_LOGI(TAG, "LED Strip initialized on GPIO %d", LED_STRIP_GPIO_PIN);
 
-  // Initialize LED Animation System
-  led_msgq = xQueueCreate(32, sizeof(led_event_t));
+  // Initialize LED Animation System with larger queue to prevent overflow
+  led_msgq = xQueueCreate(128, sizeof(led_event_t));
   if (led_msgq == NULL) {
-    ESP_LOGE(TAG, "Failed to create LED message queue");
-  } else {
-    ESP_LOGI(TAG, "LED message queue created (32 events)");
+    ESP_LOGE(TAG, "FATAL: Failed to create LED message queue");
+    abort(); // Cannot continue without LED queue
   }
+  ESP_LOGI(TAG, "LED message queue created (128 events)");
 
   // Initialize pixel buffers to black
   memset(pixels, 0, sizeof(pixels));
