@@ -32,8 +32,8 @@ static const char *TAG = "velocity_matrix";
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
 
 // --- LED Animation System ---
-#define LED_FRAME_RATE_MS 16 // ~60 FPS
-#define LERP_FACTOR 0.5f     // 50% movement per frame (faster animation)
+#define LED_FRAME_RATE_MS 8 // ~120 FPS for faster response (was 16ms/60fps)
+#define LERP_FACTOR 0.12f   // Balanced fade speed
 
 // LED Event Types
 typedef enum { LED_EVENT_NOTE_ON, LED_EVENT_NOTE_OFF } led_event_type_t;
@@ -90,15 +90,24 @@ typedef struct {
 
 // LED Configuration
 #define LED_VELOCITY_SCALE 2
-#define LED_MAX_BRIGHTNESS 100 // Increased for better visibility
+#define LED_MAX_BRIGHTNESS 100 // Maximum brightness
+#define LED_MIN_BRIGHTNESS                                                     \
+  15 // Minimum brightness (15%) for soft notes visibility
 #define LED_OFF 0
+#define LED_SATURATION 0.85f // 85% saturation for vibrant but not harsh colors
 
-#define VELOCITY_CURVE 2.0
+#define VELOCITY_CURVE 1.8 // Optimized for better mid-range dynamics (was 2.0)
+
+// LED Attack Effect (makes note-on more punchy)
+#define LED_ATTACK_BOOST 1.5f      // 50% brighter during attack
+#define LED_ATTACK_DURATION_MS 100 // Attack lasts 100ms
 
 // LED Animation System Globals
 static QueueHandle_t led_msgq;
 static rgb_color_t pixels[LED_STRIP_LED_NUMBERS];        // Current displayed
 static rgb_color_t target_pixels[LED_STRIP_LED_NUMBERS]; // Target colors
+static SemaphoreHandle_t
+    led_mutex; // Protect target_pixels from race conditions
 
 typedef struct {
   gpio_num_t col_gpios[COLS_PER_MATRIX];
@@ -117,6 +126,8 @@ typedef struct {
   bool key_pressed;
   int velocity;
   int release_velocity;
+  uint8_t last_velocity;     // Track last velocity for LED updates
+  int64_t attack_start_time; // For LED attack effect
 } KeyState;
 
 static KeyState keys[NUM_KEYS];
@@ -160,13 +171,8 @@ static void blemidi_tick_timer_callback(void *arg) { blemidi_tick(); }
 // --- LED Animation Helper Functions ---
 
 // Linear interpolation for smooth color transitions
-static uint8_t lerp_u8(uint8_t current, uint8_t target, float factor) {
-  // If very close to target, snap to it (prevents floating-point rounding
-  // issues)
-  if (abs((int)current - (int)target) <= 3) {
-    return target;
-  }
-  return (uint8_t)(current + (target - current) * factor);
+static uint8_t lerp_u8(uint8_t a, uint8_t b, float t) {
+  return (uint8_t)(a + t * (b - a));
 }
 
 static void lerp_color(rgb_color_t *current, const rgb_color_t *target) {
@@ -175,16 +181,90 @@ static void lerp_color(rgb_color_t *current, const rgb_color_t *target) {
   current->b = lerp_u8(current->b, target->b, LERP_FACTOR);
 }
 
-// Simple velocity-based color (white gradient)
+// Velocity-based rainbow color gradient with saturation control
+// Soft notes (low velocity) = Blue/Cyan
+// Medium notes = Green/Yellow
+// Hard notes (high velocity) = Orange/Red
 static rgb_color_t get_led_color(uint8_t velocity) {
   rgb_color_t color = {0, 0, 0};
   float intensity = (velocity / 127.0f);
-  uint8_t brightness = (uint8_t)(intensity * LED_MAX_BRIGHTNESS);
 
-  // White gradient based on velocity
-  color.r = brightness;
-  color.g = brightness;
-  color.b = brightness;
+  // Apply minimum brightness for visibility
+  uint8_t brightness =
+      (uint8_t)(intensity * (LED_MAX_BRIGHTNESS - LED_MIN_BRIGHTNESS) +
+                LED_MIN_BRIGHTNESS);
+
+  // Map velocity to hue (0-127 → 240° to 0° on color wheel)
+  // 240° = Blue, 120° = Green, 60° = Yellow, 0° = Red
+  float hue = 240.0f * (1.0f - intensity); // Reverse: soft=blue, hard=red
+
+  // Convert HSV to RGB with saturation control
+  // First calculate fully saturated color
+  rgb_color_t saturated = {0, 0, 0};
+
+  if (hue >= 240) {
+    // Blue (240°-180°)
+    float factor = (hue - 180.0f) / 60.0f;
+    saturated.b = brightness;
+    saturated.g = (uint8_t)((1.0f - factor) * brightness);
+  } else if (hue >= 180) {
+    // Cyan (180°-120°)
+    float factor = (hue - 120.0f) / 60.0f;
+    saturated.g = brightness;
+    saturated.b = (uint8_t)(factor * brightness);
+  } else if (hue >= 120) {
+    // Green (120°-60°)
+    float factor = (hue - 60.0f) / 60.0f;
+    saturated.g = brightness;
+    saturated.r = (uint8_t)((1.0f - factor) * brightness);
+  } else if (hue >= 60) {
+    // Yellow (60°-0°)
+    float factor = hue / 60.0f;
+    saturated.r = brightness;
+    saturated.g = (uint8_t)(factor * brightness);
+  } else {
+    // Red (0°)
+    saturated.r = brightness;
+  }
+
+  // Apply saturation (blend with white/gray)
+  // saturation = 1.0 means full color, 0.0 means grayscale
+  uint8_t gray = brightness;
+  color.r =
+      (uint8_t)(saturated.r * LED_SATURATION + gray * (1.0f - LED_SATURATION));
+  color.g =
+      (uint8_t)(saturated.g * LED_SATURATION + gray * (1.0f - LED_SATURATION));
+  color.b =
+      (uint8_t)(saturated.b * LED_SATURATION + gray * (1.0f - LED_SATURATION));
+
+  return color;
+}
+
+// Get LED color with attack effect (brighter during initial attack)
+static rgb_color_t get_led_color_with_attack(uint8_t velocity,
+                                             int64_t attack_start_time) {
+  rgb_color_t color = get_led_color(velocity);
+
+  // Apply attack boost if within attack duration
+  if (attack_start_time > 0) {
+    int64_t now = esp_timer_get_time();
+    int64_t attack_elapsed_ms = (now - attack_start_time) / 1000;
+
+    if (attack_elapsed_ms < LED_ATTACK_DURATION_MS) {
+      // Boost brightness during attack phase
+      color.r = (uint8_t)(color.r * LED_ATTACK_BOOST);
+      color.g = (uint8_t)(color.g * LED_ATTACK_BOOST);
+      color.b = (uint8_t)(color.b * LED_ATTACK_BOOST);
+
+      // Clamp to max brightness
+      if (color.r > 255)
+        color.r = 255;
+      if (color.g > 255)
+        color.g = 255;
+      if (color.b > 255)
+        color.b = 255;
+    }
+  }
 
   return color;
 }
@@ -258,11 +338,17 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
                    (key->midi_note / 12) - 1, (long long)release_delta,
                    release_vel);
 
-          // Send LED event
-          led_event_t led_event = {.type = LED_EVENT_NOTE_OFF,
-                                   .key_index = key_index,
-                                   .velocity = 0};
-          xQueueSend(led_msgq, &led_event, 0);
+          // Direct LED update (instant, no queue delay) - THREAD SAFE
+          if (key_index < LED_STRIP_LED_NUMBERS) {
+            if (xSemaphoreTake(led_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+              target_pixels[key_index] =
+                  (rgb_color_t){0, 0, 0}; // Fade to black
+              xSemaphoreGive(led_mutex);
+            }
+          }
+
+          // Reset attack effect
+          key->attack_start_time = 0;
 
           send_midi_note(key->midi_note, release_vel, false);
 
@@ -298,11 +384,17 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
                    key_index, get_note_name(key->midi_note),
                    (key->midi_note / 12) - 1, delta_us, key->velocity);
 
-          // Send LED event
-          led_event_t led_event = {.type = LED_EVENT_NOTE_ON,
-                                   .key_index = key_index,
-                                   .velocity = key->velocity};
-          xQueueSend(led_msgq, &led_event, 0);
+          // Direct LED update (instant, no queue delay) - THREAD SAFE
+          if (key_index < LED_STRIP_LED_NUMBERS) {
+            if (xSemaphoreTake(led_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+              key->attack_start_time =
+                  esp_timer_get_time(); // Start attack effect
+              target_pixels[key_index] = get_led_color_with_attack(
+                  key->velocity, key->attack_start_time);
+              xSemaphoreGive(led_mutex);
+            }
+          }
+          key->last_velocity = key->velocity; // Track for LED
 
           send_midi_note(key->midi_note, key->velocity, true);
         }
@@ -361,9 +453,30 @@ static void led_thread_entry(void *arg) {
       }
     }
 
-    // Phase 2: Animation - Lerp current toward target
-    for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
-      lerp_color(&pixels[i], &target_pixels[i]);
+    // Phase 2: Animation - Lerp current toward target (THREAD SAFE)
+    // Also update attack effect for active notes (optimized)
+    if (xSemaphoreTake(led_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      int64_t now = esp_timer_get_time();
+
+      // Update attack effect ONLY for keys that are pressed AND within attack
+      // duration
+      for (int i = 0; i < NUM_KEYS && i < LED_STRIP_LED_NUMBERS; i++) {
+        if (keys[i].key_pressed && keys[i].attack_start_time > 0) {
+          int64_t attack_elapsed_ms = (now - keys[i].attack_start_time) / 1000;
+
+          // Only update if still within attack duration
+          if (attack_elapsed_ms < LED_ATTACK_DURATION_MS) {
+            target_pixels[i] = get_led_color_with_attack(
+                keys[i].velocity, keys[i].attack_start_time);
+          }
+        }
+      }
+
+      // Lerp animation
+      for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
+        lerp_color(&pixels[i], &target_pixels[i]);
+      }
+      xSemaphoreGive(led_mutex);
     }
 
     // Phase 3: Render to hardware
@@ -473,20 +586,24 @@ void app_main(void) {
       led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
   ESP_LOGI(TAG, "LED Strip initialized on GPIO %d", LED_STRIP_GPIO_PIN);
 
-  // Initialize LED Animation System with larger queue to prevent overflow
+  // Create LED message queue and mutex for thread safety
   led_msgq = xQueueCreate(128, sizeof(led_event_t));
+  led_mutex = xSemaphoreCreateMutex();
+  if (led_mutex == NULL) {
+    ESP_LOGE(TAG, "Failed to create LED mutex!");
+  }
   if (led_msgq == NULL) {
     ESP_LOGE(TAG, "FATAL: Failed to create LED message queue");
     abort(); // Cannot continue without LED queue
   }
   ESP_LOGI(TAG, "LED message queue created (128 events)");
-
   // Initialize pixel buffers to black
   memset(pixels, 0, sizeof(pixels));
   memset(target_pixels, 0, sizeof(target_pixels));
 
-  // Create LED animation thread on Core 0 (separate from scan on Core 1)
-  xTaskCreatePinnedToCore(led_thread_entry, "led_thread", 4096, NULL, 3, NULL,
+  // Create LED animation thread on Core 0 with priority 4
+  // Priority: Scan (5) > LED (4) > Idle (0)
+  xTaskCreatePinnedToCore(led_thread_entry, "led_thread", 4096, NULL, 4, NULL,
                           0);
   ESP_LOGI(TAG, "LED animation thread created on Core 0");
 
@@ -513,6 +630,7 @@ void app_main(void) {
     keys[i].s1_last_change = 0;
     keys[i].sa_last_change = 0;
     keys[i].sa_release_time = 0;
+    keys[i].attack_start_time = 0; // Initialize attack timer
   }
 
   // Reset all pins to clear any default JTAG/Boot functions
