@@ -51,13 +51,6 @@ typedef struct {
   uint8_t b;
 } rgb_color_t;
 
-// LED Themes
-typedef enum {
-  LED_THEME_AURORA, // Velocity-based rainbow gradient
-  LED_THEME_FIRE,   // Red/Orange/Yellow heat map
-  LED_THEME_MATRIX  // Green cascade effect
-} led_theme_t;
-
 // --- Matrix Configuration ---
 #define NUM_MATRICES 2
 #define COLS_PER_MATRIX 4
@@ -92,8 +85,8 @@ typedef enum {
 #define VELOCITY_TIMEOUT_US 2000000 // 2s timeout for slow presses
 
 // Debounce Configuration
-#define DEBOUNCE_TIME_US 20000 // 20ms lockout (increased to prevent bounce)
-#define SCAN_INTERVAL_US 50    // Target 20kHz scan rate
+#define DEBOUNCE_TIME_US 5000 // 5ms - faster response, still stable
+#define SCAN_INTERVAL_US 50   // Target 20kHz scan rate
 
 // LED Configuration
 #define LED_VELOCITY_SCALE 2
@@ -106,7 +99,6 @@ typedef enum {
 static QueueHandle_t led_msgq;
 static rgb_color_t pixels[LED_STRIP_LED_NUMBERS];        // Current displayed
 static rgb_color_t target_pixels[LED_STRIP_LED_NUMBERS]; // Target colors
-// Note: current_theme is now controlled by g_led_theme from BLE config
 
 typedef struct {
   gpio_num_t col_gpios[COLS_PER_MATRIX];
@@ -447,9 +439,10 @@ void app_main(void) {
         .name = "blemidi_tick"};
     ret = esp_timer_create(&blemidi_tick_args, &blemidi_tick_timer);
     if (ret == ESP_OK) {
-      ret = esp_timer_start_periodic(blemidi_tick_timer, 1000); // 1ms = 1000us
+      ret = esp_timer_start_periodic(
+          blemidi_tick_timer, 5000); // 5ms - optimized for lower CPU usage
       if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "BLE MIDI tick timer started (1ms interval)");
+        ESP_LOGI(TAG, "BLE MIDI tick timer started (5ms interval)");
       } else {
         ESP_LOGE(TAG, "Failed to start BLE MIDI tick timer: %d", ret);
       }
