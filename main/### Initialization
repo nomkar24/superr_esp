@@ -1,0 +1,31 @@
+### Initialization
+Launch the BLE Server with:
+
+```
+void app_main() { // install BLE MIDI service int status = blemidi_init(callback_midi_message_received); if( status < 0 ) { ESP_LOGE(BLEMIDI_TAG, "BLE MIDI Driver returned status=%d", status); } else { ESP_LOGI(BLEMIDI_TAG, "BLE MIDI Driver initialized successfully"); xTaskCreate(task_midi, "task_midi", 4096, NULL, 8, NULL); } }
+```
+
+and:
+- register a callback for incoming MIDI messages
+- launch a task for sending MIDI messages
+
+### Receiving MIDI
+See callback_midi_message_received() function in blemidi_demo.c.
+API:
+
+```
+void callback_midi_message_received(uint8_t blemidi_port, uint16_t timestamp, uint8_t midi_status, uint8_t *remaining_message, size_t len)
+```
+
+- blemidi_port is currently always 0!
+- timestamp is based on BLE MIDI spec (1 mS resolution)
+- midi_status contains the MIDI Status byte - running status has already been considered by the driver
+- remaining_message and len: the remaining bytes (typically 2, e.g. Note or CCs, or much more on SysEx streams)
+
+### Sending MIDI
+See task_midi() function in blemidi_demo.c.
+Currently no comfortable API exists, it might come later:
+
+```
+{ // TODO: more comfortable packet creation via special APIs uint8_t message[3] = { 0x90, 0x3c, 0x7f }; blemidi_send_packet(0, message, sizeof(message)); }
+```

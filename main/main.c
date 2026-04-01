@@ -27,7 +27,7 @@
 static const char *TAG = "velocity_matrix";
 
 // --- LED Strip Config ---
-#define LED_STRIP_GPIO_PIN 10
+#define LED_STRIP_GPIO_PIN 16
 #define LED_STRIP_LED_NUMBERS 24
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
 
@@ -61,22 +61,22 @@ typedef struct {
 #define COL1_GPIO 4
 #define COL2_GPIO 5
 #define COL3_GPIO 6
-#define COL4_GPIO 15
+#define COL4_GPIO 7
 
 // Matrix 1 Rows (S1 - First Contact) (OUTPUT)
-#define M1_ROW1_GPIO 16
-#define M1_ROW2_GPIO 17
-#define M1_ROW3_GPIO 18
-#define M1_ROW4_GPIO 8
-#define M1_ROW5_GPIO 3
-#define M1_ROW6_GPIO 46
+#define M1_ROW1_GPIO 3
+#define M1_ROW2_GPIO 46
+#define M1_ROW3_GPIO 9
+#define M1_ROW4_GPIO 10
+#define M1_ROW5_GPIO 11
+#define M1_ROW6_GPIO 12
 
 // Matrix 2 Rows (SA - Second Contact) (OUTPUT)
-#define M2_ROW1_GPIO 35
-#define M2_ROW2_GPIO 36
-#define M2_ROW3_GPIO 37
-#define M2_ROW4_GPIO 38
-#define M2_ROW5_GPIO 39
+#define M2_ROW1_GPIO 13
+#define M2_ROW2_GPIO 14
+#define M2_ROW3_GPIO 21
+#define M2_ROW4_GPIO 47
+#define M2_ROW5_GPIO 48
 #define M2_ROW6_GPIO 45
 
 // Velocity Calculation Config
@@ -103,6 +103,7 @@ typedef struct {
 #define LED_ATTACK_DURATION_MS 100 // Attack lasts 100ms
 
 // LED Animation System Globals
+static int64_t startup_end_time = 0;
 static QueueHandle_t led_msgq;
 static rgb_color_t pixels[LED_STRIP_LED_NUMBERS];        // Current displayed
 static rgb_color_t target_pixels[LED_STRIP_LED_NUMBERS]; // Target colors
@@ -479,6 +480,19 @@ static void led_thread_entry(void *arg) {
       xSemaphoreGive(led_mutex);
     }
 
+    // Startup Animation Override
+    int64_t now = esp_timer_get_time();
+    if (now < startup_end_time) {
+      float time_sec = (float)now / 1000000.0f;
+      for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
+        // Rainbow wave effect
+        float phase = time_sec * 3.0f + i * 0.3f;
+        pixels[i].r = (uint8_t)(60 + 60 * sinf(phase));
+        pixels[i].g = (uint8_t)(60 + 60 * sinf(phase + 2.094f)); // 120 deg
+        pixels[i].b = (uint8_t)(60 + 60 * sinf(phase + 4.188f)); // 240 deg
+      }
+    }
+
     // Phase 3: Render to hardware
     for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
       led_strip_set_pixel(led_strip, i, pixels[i].r, pixels[i].g, pixels[i].b);
@@ -502,7 +516,8 @@ static void scan_task(void *arg) {
       esp_rom_delay_us(10); // Settling time
 
       for (int r = 0; r < ROWS_PER_MATRIX; r++) {
-        int key_index = (r * COLS_PER_MATRIX) + c;
+        // Reversed mapping: Key 1 was mapped with Key 24
+        int key_index = (NUM_KEYS - 1) - ((r * COLS_PER_MATRIX) + c);
 
         // Read Rows
         bool s1_active = gpio_get_level(matrices[0].row_gpios[r]);
@@ -531,6 +546,9 @@ void app_main(void) {
     ret = nvs_flash_init();
   }
   ESP_ERROR_CHECK(ret);
+
+  // Set startup LED effect timer (6 seconds)
+  startup_end_time = esp_timer_get_time() + (6 * 1000000LL);
 
   // Initialize BLE MIDI using library
   ESP_LOGI(TAG, "Initializing BLE MIDI library...");
