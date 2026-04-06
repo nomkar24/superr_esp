@@ -13,12 +13,14 @@
 // BLE config service removed - simplified to MIDI only
 #include "blemidi.h"
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "led_strip.h"
 #include "nvs_flash.h"
+#include "esp_sleep.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +36,10 @@ static const char *TAG = "velocity_matrix";
 // --- LED Animation System ---
 #define LED_FRAME_RATE_MS 8 // ~120 FPS for faster response (was 16ms/60fps)
 #define LERP_FACTOR 0.12f   // Balanced fade speed
+
+#define STARTUP_DURATION_S 12.0f
+#define POWER_BUTTON_GPIO 15
+#define SLEEP_THRESHOLD_MS 2000 // 2s hold to shut down
 
 // LED Event Types
 typedef enum { LED_EVENT_NOTE_ON, LED_EVENT_NOTE_OFF } led_event_type_t;
@@ -107,6 +113,7 @@ typedef struct {
 
 // LED Animation System Globals
 static int64_t startup_end_time = 0;
+static TaskHandle_t led_task_handle = NULL;
 static QueueHandle_t led_msgq;
 static rgb_color_t pixels[LED_STRIP_LED_NUMBERS];        // Current displayed
 static rgb_color_t target_pixels[LED_STRIP_LED_NUMBERS]; // Target colors
@@ -270,17 +277,9 @@ static rgb_color_t get_led_color_with_attack(uint8_t velocity,
 
     if (attack_elapsed_ms < LED_ATTACK_DURATION_MS) {
       // Boost brightness during attack phase
-      color.r = (uint8_t)(color.r * LED_ATTACK_BOOST);
-      color.g = (uint8_t)(color.g * LED_ATTACK_BOOST);
-      color.b = (uint8_t)(color.b * LED_ATTACK_BOOST);
-
-      // Clamp to max brightness
-      if (color.r > 255)
-        color.r = 255;
-      if (color.g > 255)
-        color.g = 255;
-      if (color.b > 255)
-        color.b = 255;
+      color.r = (uint8_t)fminf(color.r * LED_ATTACK_BOOST, 255.0f);
+      color.g = (uint8_t)fminf(color.g * LED_ATTACK_BOOST, 255.0f);
+      color.b = (uint8_t)fminf(color.b * LED_ATTACK_BOOST, 255.0f);
     }
   }
 
@@ -536,7 +535,140 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
   xSemaphoreGive(key_state_mutex);
 }
 
-// LED Thread - Runs at 60 FPS on Core 0
+// --- Startup & Power Management Helpers ---
+
+static void update_startup_animation(int64_t now) {
+  if (now < startup_end_time) {
+    const float total_duration = STARTUP_DURATION_S;
+    int64_t anim_start = startup_end_time - (int64_t)(total_duration * 1000000LL);
+    float elapsed_sec = (float)(now - anim_start) / 1000000.0f;
+    float progress = elapsed_sec / total_duration; // 0.0 → 1.0
+
+    // Smooth fade-in (first ~0.5s) and fade-out (last ~1.5s)
+    float brightness = smoothstep(0.0f, 0.05f, progress) *
+                       smoothstep(1.0f, 0.85f, progress);
+
+    for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
+      // Dynamic rainbow sweep
+      float hue = fmodf(
+          (float)i / (float)LED_STRIP_LED_NUMBERS * 360.0f + elapsed_sec * 80.0f,
+          360.0f);
+      pixels[i] = hsv_to_rgb(hue, 1.0f, brightness);
+    }
+  }
+}
+
+static void run_shutdown_animation() {
+  ESP_LOGI(TAG, "Running shutdown animation...");
+  const int duration_ms = 800;
+  const int steps = 40;
+  const int delay_per_step = duration_ms / steps;
+
+  for (int step = 0; step < steps; step++) {
+    float progress = (float)step / (float)steps;
+    float spread = (1.0f - progress) * (LED_STRIP_LED_NUMBERS / 2.0f);
+    int center = LED_STRIP_LED_NUMBERS / 2;
+
+    for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
+       float dist = fabsf((float)i - (float)center);
+       if (dist < spread) {
+         // Fading red intensity
+         uint8_t r = (uint8_t)(255 * (1.0f - progress));
+         led_strip_set_pixel(led_strip, i, r, 0, 0);
+       } else {
+         led_strip_set_pixel(led_strip, i, 0, 0, 0);
+       }
+    }
+    led_strip_refresh(led_strip);
+    vTaskDelay(pdMS_TO_TICKS(delay_per_step));
+  }
+  
+  // Final clear
+  for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
+    led_strip_set_pixel(led_strip, i, 0, 0, 0);
+  }
+  led_strip_refresh(led_strip);
+}
+
+static void disarm_matrix_for_sleep() {
+  ESP_LOGI(TAG, "Disarming keyboard matrix for sleep...");
+  
+  // Disable Columns (Set to Input, no pull)
+  for (int c = 0; c < COLS_PER_MATRIX; c++) {
+    gpio_reset_pin(shared_cols[c]);
+    gpio_set_direction(shared_cols[c], GPIO_MODE_DISABLE);
+  }
+
+  // Disable Matrix 1 & 2 Rows
+  for (int m = 0; m < NUM_MATRICES; m++) {
+    for (int r = 0; r < ROWS_PER_MATRIX; r++) {
+      gpio_reset_pin(matrices[m].row_gpios[r]);
+      gpio_set_direction(matrices[m].row_gpios[r], GPIO_MODE_DISABLE);
+    }
+  }
+}
+
+static void enter_deep_sleep() {
+  ESP_LOGI(TAG, "Preparing to sleep...");
+  
+  // 1. Suspend main LED task to prevent RMT conflicts during shutdown animation
+  if (led_task_handle != NULL) {
+    vTaskSuspend(led_task_handle);
+    ESP_LOGI(TAG, "LED Task suspended.");
+  }
+  
+  // 2. Show Red Shutdown Animation
+  run_shutdown_animation();
+
+  // 3. WAIT for the button to be released!
+  ESP_LOGI(TAG, "Waiting for button release...");
+  while (gpio_get_level(POWER_BUTTON_GPIO) == 0) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  
+  // 4. Disarm keyboard keys to prevent "Any Key" wakeup
+  disarm_matrix_for_sleep();
+
+  // 5. Grace Period (500ms) to ensure no noise triggers instant wakeup
+  ESP_LOGI(TAG, "Grace period (500ms)...");
+  vTaskDelay(pdMS_TO_TICKS(500)); 
+
+  // 6. Configure Wakeup (GPIO 15 is active low)
+  // Switch to EXT1 for better stability and explicit RTC pull-up
+  rtc_gpio_pullup_en(POWER_BUTTON_GPIO);
+  rtc_gpio_pulldown_dis(POWER_BUTTON_GPIO);
+  esp_sleep_enable_ext1_wakeup(1ULL << POWER_BUTTON_GPIO, ESP_EXT1_WAKEUP_ANY_LOW);
+
+  ESP_LOGI(TAG, "Entering Deep Sleep... Bye!");
+  vTaskDelay(pdMS_TO_TICKS(100)); // Quiet time
+  esp_deep_sleep_start();
+}
+
+static void power_button_task(void *arg) {
+  ESP_LOGI(TAG, "Power button task started on GPIO %d", POWER_BUTTON_GPIO);
+  int64_t hold_start_time = 0;
+  
+  while (1) {
+    bool pressed = (gpio_get_level(POWER_BUTTON_GPIO) == 0);
+
+    if (pressed) {
+      if (hold_start_time == 0) {
+        hold_start_time = esp_timer_get_time();
+      } else {
+        int64_t hold_duration_ms = (esp_timer_get_time() - hold_start_time) / 1000;
+        if (hold_duration_ms > SLEEP_THRESHOLD_MS) {
+          enter_deep_sleep();
+          // Logic ends here if successful
+        }
+      }
+    } else {
+      hold_start_time = 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20)); // Check at 50Hz
+  }
+}
+
+// LED Thread - Runs at high FPS on Core 0
 static void led_thread_entry(void *arg) {
   ESP_LOGI(TAG, "LED Animation Thread started @ 60 FPS on Core 0");
 
@@ -571,8 +703,8 @@ static void led_thread_entry(void *arg) {
 
     // Phase 2: Animation - Lerp current toward target (THREAD SAFE)
     // Also update attack effect for active notes (optimized)
+    int64_t now = esp_timer_get_time();
     if (xSemaphoreTake(led_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-      int64_t now = esp_timer_get_time();
 
       // Read keys[] under key_state_mutex (taken inside led_mutex, same order
       // as Phase 1 above – prevents deadlock with scan_task on Core 1).
@@ -606,29 +738,8 @@ static void led_thread_entry(void *arg) {
       xSemaphoreGive(led_mutex);
     }
 
-    // Rainbow Wash startup animation (6-second sequence)
-    // Phase 1 (0–4.5s): Full-spectrum rainbow sweeps left → right.
-    // Phase 2 (4.5–6s): Brightness fades out cleanly to black.
-    int64_t now = esp_timer_get_time();
-    if (now < startup_end_time) {
-      const float total_duration = 6.0f;
-      int64_t anim_start = startup_end_time - 6000000LL;
-      float elapsed_sec = (float)(now - anim_start) / 1000000.0f;
-      float progress = elapsed_sec / total_duration; // 0.0 → 1.0
-
-      // Smooth fade-in (first ~0.5s) and fade-out (last ~1.5s)
-      float brightness = smoothstep(0.0f, 0.08f, progress) *
-                         smoothstep(1.0f, 0.75f, progress);
-
-      for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
-        // Spread the full 360° spectrum across the strip, sweeping at 60°/s.
-        // At t=0 the rainbow is already placed; it shifts rightward over time.
-        float hue = fmodf(
-            (float)i / (float)LED_STRIP_LED_NUMBERS * 360.0f + elapsed_sec * 60.0f,
-            360.0f);
-        pixels[i] = hsv_to_rgb(hue, 1.0f, brightness);
-      }
-    }
+    // Update startup animation if active
+    update_startup_animation(now);
 
     // Phase 3: Render to hardware
     for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
@@ -686,8 +797,26 @@ void app_main(void) {
   }
   ESP_ERROR_CHECK(ret);
 
+  // Small delay to ensure Serial Monitor has time to reconnect
+  vTaskDelay(pdMS_TO_TICKS(1000));
+
+  // --- Wakeup Reason Logger ---
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch (wakeup_reason) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      ESP_LOGI(TAG, "WAKEUP: System started by POWER BUTTON (EXT0)");
+      break;
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+      ESP_LOGI(TAG, "WAKEUP: System started by Power-On Reset (POR)");
+      break;
+    default:
+      ESP_LOGI(TAG, "WAKEUP: Other cause (%d)", wakeup_reason);
+      break;
+  }
+
   // Set startup LED effect timer (6 seconds)
-  startup_end_time = esp_timer_get_time() + (6 * 1000000LL);
+  // Set startup LED effect timer (calculated from STARTUP_DURATION_S)
+  startup_end_time = esp_timer_get_time() + (int64_t)(STARTUP_DURATION_S * 1000000LL);
 
   // Initialize BLE MIDI using library
   ESP_LOGI(TAG, "Initializing BLE MIDI library...");
@@ -766,7 +895,7 @@ void app_main(void) {
 
   // Create LED animation thread on Core 0 with priority 4
   // Priority: Scan (5) > LED (4) > Idle (0)
-  xTaskCreatePinnedToCore(led_thread_entry, "led_thread", 4096, NULL, 4, NULL,
+  xTaskCreatePinnedToCore(led_thread_entry, "led_thread", 4096, NULL, 4, &led_task_handle,
                           0);
   ESP_LOGI(TAG, "LED animation thread created on Core 0");
 
@@ -843,13 +972,27 @@ void app_main(void) {
       .pull_up_en = 0,
   };
   gpio_config(&row_conf);
+  
+  // --- Power Button Initialization (GPIO 15) ---
+  gpio_config_t pwr_conf = {
+      .intr_type = GPIO_INTR_DISABLE,
+      .mode = GPIO_MODE_INPUT,
+      .pin_bit_mask = (1ULL << POWER_BUTTON_GPIO),
+      .pull_down_en = 0,
+      .pull_up_en = 1, // Connected to GND, need pull-up
+  };
+  gpio_config(&pwr_conf);
+  ESP_LOGI(TAG, "Power Button Initialized on GPIO %d", POWER_BUTTON_GPIO);
 
   ESP_LOGI(TAG, "24-Key Velocity Matrix Initialized");
 
   // Create HIGH Priority Task on Core 1
   xTaskCreatePinnedToCore(scan_task, "scan_task", 4096, NULL, 5, NULL, 1);
 
-  // Idle in main task or delete
+  // --- Power Button Task Initialization ---
+  xTaskCreate(power_button_task, "pwr_btn", 4096, NULL, 5, NULL);
+
+  // Main loop: Just idle or monitor tasks
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
