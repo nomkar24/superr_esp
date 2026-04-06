@@ -287,6 +287,25 @@ static rgb_color_t get_led_color_with_attack(uint8_t velocity,
   return color;
 }
 
+// HSV → RGB helper used by the startup rainbow animation
+// H: 0–360°, S: 0–1, V: 0–1  →  rgb_color_t (each channel 0–255)
+static rgb_color_t hsv_to_rgb(float h, float s, float v) {
+  float c = v * s;
+  float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+  float m = v - c;
+  float r = 0.0f, g = 0.0f, b = 0.0f;
+  if      (h < 60.0f)  { r = c; g = x; b = 0; }
+  else if (h < 120.0f) { r = x; g = c; b = 0; }
+  else if (h < 180.0f) { r = 0; g = c; b = x; }
+  else if (h < 240.0f) { r = 0; g = x; b = c; }
+  else if (h < 300.0f) { r = x; g = 0; b = c; }
+  else                 { r = c; g = 0; b = x; }
+  return (rgb_color_t){
+      (uint8_t)((r + m) * 255.0f),
+      (uint8_t)((g + m) * 255.0f),
+      (uint8_t)((b + m) * 255.0f)};
+}
+
 // Function to calculate velocity from time delta (us)
 static uint8_t calculate_velocity(int64_t delta_us) {
   if (delta_us < MIN_TIME_US)
@@ -587,57 +606,27 @@ static void led_thread_entry(void *arg) {
       xSemaphoreGive(led_mutex);
     }
 
-    // Ultra-Premium 'Ember to Moonlight' Transition (6-second sequence)
+    // Rainbow Wash startup animation (6-second sequence)
+    // Phase 1 (0–4.5s): Full-spectrum rainbow sweeps left → right.
+    // Phase 2 (4.5–6s): Brightness fades out cleanly to black.
     int64_t now = esp_timer_get_time();
     if (now < startup_end_time) {
-      // Compute elapsed time from animation start (not absolute uptime).
-      // startup_end_time = anim_start + 6s, so anim_start = startup_end_time - 6s.
       const float total_duration = 6.0f;
       int64_t anim_start = startup_end_time - 6000000LL;
       float elapsed_sec = (float)(now - anim_start) / 1000000.0f;
       float progress = elapsed_sec / total_duration; // 0.0 → 1.0
 
-      // Cinematic Ease-In/Out for Global Brightness
-      float global_brightness = smoothstep(0.0f, 0.2f, progress) *
-                                smoothstep(1.0f, 0.8f, progress);
+      // Smooth fade-in (first ~0.5s) and fade-out (last ~1.5s)
+      float brightness = smoothstep(0.0f, 0.08f, progress) *
+                         smoothstep(1.0f, 0.75f, progress);
 
       for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
-        // Spatial math: 0.0 at center, 1.0 at ends
-        float center = (LED_STRIP_LED_NUMBERS - 1) / 2.0f;
-        float norm_dist = fabsf((float)i - center) / center;
-
-        // Stage 1: Warm Ember Blow (Goldenrod / Burnt Orange)
-        // Stage 2: Moonlit Cool (Midnight Blue / Silver)
-        float stage1 = smoothstep(0.8f, 0.2f, progress);
-        float stage2 = smoothstep(0.3f, 0.9f, progress);
-
-        // Dynamic "Breath" pulse (uses elapsed_sec so phase starts at 0)
-        float breath = 0.7f + 0.3f * sinf(elapsed_sec * 1.4f);
-
-        // Organic Glow Spread (Liquid movement)
-        // Center glows first, then spreads outward like heat
-        float heat_map = expf(-norm_dist * (4.0f - 3.5f * progress));
-
-        // Composite Color logic (R,G,B as 0.0 - 255.0)
-        // Stage 1 palette
-        float r1 = 255.0f * heat_map * breath;
-        float g1 = 110.0f * heat_map;
-        float b1 = 25.0f * (1.0f - norm_dist);
-
-        // Stage 2 palette
-        float r2 = 60.0f * norm_dist;
-        float g2 = 140.0f * (1.0f - heat_map);
-        float b2 = 255.0f * heat_map * stage2;
-
-        // Blending Phase
-        float final_r = (r1 * stage1) + (r2 * stage2 * 0.6f);
-        float final_g = (g1 * stage1) + (g2 * stage2);
-        float final_b = (b1 * stage1) + (b2 * stage2);
-
-        // Perceived Luminosity (Gamma 2.2) to eliminate "stepping" at low levels
-        pixels[i].r = (uint8_t)(powf(final_r / 255.0f, 1.8f) * 255.0f * global_brightness);
-        pixels[i].g = (uint8_t)(powf(final_g / 255.0f, 1.8f) * 255.0f * global_brightness);
-        pixels[i].b = (uint8_t)(powf(final_b / 255.0f, 1.8f) * 255.0f * global_brightness);
+        // Spread the full 360° spectrum across the strip, sweeping at 60°/s.
+        // At t=0 the rainbow is already placed; it shifts rightward over time.
+        float hue = fmodf(
+            (float)i / (float)LED_STRIP_LED_NUMBERS * 360.0f + elapsed_sec * 60.0f,
+            360.0f);
+        pixels[i] = hsv_to_rgb(hue, 1.0f, brightness);
       }
     }
 
@@ -747,7 +736,8 @@ void app_main(void) {
 #else
       .clk_src = RMT_CLK_SRC_DEFAULT,
       .resolution_hz = LED_STRIP_RMT_RES_HZ,
-      .flags.with_dma = false,
+      .flags.with_dma = true, // DMA: RMT streams LED data in background,
+                               // CPU is free during the ~770us WS2812 transfer
 #endif
   };
   ESP_ERROR_CHECK(
