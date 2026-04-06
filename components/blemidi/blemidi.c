@@ -842,14 +842,10 @@ int32_t blemidi_init(void *_callback_midi_message_received) {
   // callback will be installed if driver was booted successfully
   blemidi_callback_midi_message_received = NULL;
 
-  /* Initialize NVS. */
-  ret = nvs_flash_init();
-  if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-      ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    ret = nvs_flash_init();
-  }
-  ESP_ERROR_CHECK(ret);
+  // NOTE: NVS must be initialized by the caller (app_main) before calling
+  // blemidi_init(). Initializing it here a second time would cause
+  // ESP_ERROR_CHECK to panic on IDF versions that return an error for a
+  // redundant nvs_flash_init() call.
 
   ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 

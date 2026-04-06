@@ -82,14 +82,17 @@ typedef struct {
 // Velocity Calculation Config
 #define MIN_TIME_US 2000            // 2ms (Max Velocity 127)
 #define MAX_TIME_US 200000          // 200ms (Min Velocity 1)
-#define VELOCITY_TIMEOUT_US 2000000 // 2s timeout for slow presses
+#define TRIGGER_TIMEOUT_US 500000   // 500ms auto-trigger note if SA missed
 
 // Debounce Configuration
-#define DEBOUNCE_TIME_US 5000 // 5ms - faster response, still stable
+#define DEBOUNCE_TIME_US 9000 // 9ms - filtered oscillation
 #define SCAN_INTERVAL_US 50   // Target 20kHz scan rate
 
+// S1 Robustness Config
+#define S1_ABORT_COOLDOWN_US 50000 // 50ms cooldown after an abort
+#define S1_GRACE_PERIOD_US 10000    // 10ms grace period for S1 micro-breaks
+
 // LED Configuration
-#define LED_VELOCITY_SCALE 2
 #define LED_MAX_BRIGHTNESS 100 // Maximum brightness
 #define LED_MIN_BRIGHTNESS                                                     \
   15 // Minimum brightness (15%) for soft notes visibility
@@ -108,7 +111,9 @@ static QueueHandle_t led_msgq;
 static rgb_color_t pixels[LED_STRIP_LED_NUMBERS];        // Current displayed
 static rgb_color_t target_pixels[LED_STRIP_LED_NUMBERS]; // Target colors
 static SemaphoreHandle_t
-    led_mutex; // Protect target_pixels from race conditions
+    led_mutex; // Protect target_pixels / pixels from race conditions
+static SemaphoreHandle_t
+    key_state_mutex; // Protect KeyState fields shared between Core 0 and Core 1
 
 typedef struct {
   gpio_num_t col_gpios[COLS_PER_MATRIX];
@@ -127,6 +132,7 @@ typedef struct {
   bool key_pressed;
   int velocity;
   int release_velocity;
+  int64_t last_s1_abort_time; // Cooldown for S1 triggers
   uint8_t last_velocity;     // Track last velocity for LED updates
   int64_t attack_start_time; // For LED attack effect
 } KeyState;
@@ -160,10 +166,11 @@ static const char *get_note_name(int note) { return note_names[note % 12]; }
 // BLE MIDI receive callback (optional - for handling incoming MIDI)
 void callback_midi_message_received(uint8_t blemidi_port, uint16_t timestamp,
                                     uint8_t midi_status,
-                                    uint8_t *remaining_message, size_t len) {
+                                    uint8_t *remaining_message, size_t len,
+                                    size_t continued_sysex_pos) {
   // Handle incoming MIDI if needed (e.g., for configuration)
-  ESP_LOGI(TAG, "MIDI RX: port=%d, status=0x%02x, len=%zu", blemidi_port,
-           midi_status, len);
+  ESP_LOGI(TAG, "MIDI RX: port=%d, status=0x%02x, len=%zu, sysex_pos=%zu",
+           blemidi_port, midi_status, len, continued_sysex_pos);
 }
 
 // BLE MIDI tick timer callback - called every 1ms to flush output buffer
@@ -180,6 +187,16 @@ static void lerp_color(rgb_color_t *current, const rgb_color_t *target) {
   current->r = lerp_u8(current->r, target->r, LERP_FACTOR);
   current->g = lerp_u8(current->g, target->g, LERP_FACTOR);
   current->b = lerp_u8(current->b, target->b, LERP_FACTOR);
+}
+
+// Smoothstep interpolation (Cubic Hermite)
+static float smoothstep(float edge0, float edge1, float x) {
+  float t = (x - edge0) / (edge1 - edge0);
+  if (t < 0.0f)
+    return 0.0f;
+  if (t > 1.0f)
+    return 1.0f;
+  return t * t * (3.0f - 2.0f * t);
 }
 
 // Velocity-based rainbow color gradient with saturation control
@@ -281,6 +298,9 @@ static uint8_t calculate_velocity(int64_t delta_us) {
                              (float)(MAX_TIME_US - MIN_TIME_US));
   float curved = powf(normalized, VELOCITY_CURVE);
   int velocity = (int)(curved * 126.0f) + 1;
+  
+  // Fake Key Sensitivity: Randomize velocity slightly (±7) for more human feel
+  velocity += (rand() % 15) - 7;
 
   // No sensitivity scaling - removed for simplicity
 
@@ -315,6 +335,10 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
   KeyState *key = &keys[key_index];
   int64_t now = esp_timer_get_time();
 
+  // Acquire key_state_mutex so the LED thread (Core 0) never sees a
+  // half-written KeyState while we update key_pressed / velocity / etc.
+  xSemaphoreTake(key_state_mutex, portMAX_DELAY);
+
   // --- S1 Debounce (Eager) ---
   if (s1_raw != key->s1_stable) {
     if ((now - key->s1_last_change) > DEBOUNCE_TIME_US) {
@@ -323,10 +347,15 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
 
       // S1 Rising Edge
       if (key->s1_stable && !key->timer_running && !key->key_pressed) {
-        key->start_time = now;
-        key->timer_running = true;
-        ESP_LOGI(TAG, "Key %d (%s%d): S1 (First Contact) detected", key_index,
-                 get_note_name(key->midi_note), (key->midi_note / 12) - 1);
+        // Cooldown Check: Prevent rapid re-triggers if recently aborted
+        if ((now - key->last_s1_abort_time) > S1_ABORT_COOLDOWN_US) {
+          key->start_time = now;
+          key->timer_running = true;
+          ESP_LOGI(TAG, "Key %d (%s%d): S1 (First Contact) detected", key_index,
+                   get_note_name(key->midi_note), (key->midi_note / 12) - 1);
+        } else {
+          ESP_LOGD(TAG, "Key %d: S1 trigger suppressed (cooldown active)", key_index);
+        }
       }
       // S1 Falling Edge (Release Complete)
       else if (!key->s1_stable) {
@@ -339,24 +368,24 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
                    (key->midi_note / 12) - 1, (long long)release_delta,
                    release_vel);
 
-          // Direct LED update (instant, no queue delay) - THREAD SAFE
+          // Send LED OFF event to queue
           if (key_index < LED_STRIP_LED_NUMBERS) {
-            if (xSemaphoreTake(led_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-              target_pixels[key_index] =
-                  (rgb_color_t){0, 0, 0}; // Fade to black
-              xSemaphoreGive(led_mutex);
-            }
+            led_event_t led_event = {
+                .type = LED_EVENT_NOTE_OFF,
+                .key_index = (uint8_t)key_index,
+                .velocity = 0};
+            xQueueSend(led_msgq, &led_event, 0);
           }
 
-          // Reset attack effect
           key->attack_start_time = 0;
 
           send_midi_note(key->midi_note, release_vel, false);
 
           key->key_pressed = false;
         } else if (key->timer_running) {
-          key->timer_running = false;
-          ESP_LOGW(TAG, "Key %d (%s%d): S1 Released before SA (Aborted)",
+          // Grace period check: Don't abort immediately on S1 release.
+          // The abort will be handled by the timeout or dedicated grace check below.
+          ESP_LOGD(TAG, "Key %d (%s%d): S1 released, entering grace period",
                    key_index, get_note_name(key->midi_note),
                    (key->midi_note / 12) - 1);
         }
@@ -385,15 +414,13 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
                    key_index, get_note_name(key->midi_note),
                    (key->midi_note / 12) - 1, delta_us, key->velocity);
 
-          // Direct LED update (instant, no queue delay) - THREAD SAFE
+          // Send LED ON event to queue
           if (key_index < LED_STRIP_LED_NUMBERS) {
-            if (xSemaphoreTake(led_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-              key->attack_start_time =
-                  esp_timer_get_time(); // Start attack effect
-              target_pixels[key_index] = get_led_color_with_attack(
-                  key->velocity, key->attack_start_time);
-              xSemaphoreGive(led_mutex);
-            }
+            led_event_t led_event = {
+                .type = LED_EVENT_NOTE_ON,
+                .key_index = (uint8_t)key_index,
+                .velocity = key->velocity};
+            xQueueSend(led_msgq, &led_event, 0);
           }
           key->last_velocity = key->velocity; // Track for LED
 
@@ -407,11 +434,13 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
           ESP_LOGW(TAG, "Key %d (%s%d): SA WITHOUT S1 (Fallback)", key_index,
                    get_note_name(key->midi_note), (key->midi_note / 12) - 1);
 
-          // Don't send LED event for fallback - prevents bounce-triggered stuck
-          // LEDs led_event_t led_event = {.type = LED_EVENT_NOTE_ON,
-          //                          .key_index = key_index,
-          //                          .velocity = 127};
-          // xQueueSend(led_msgq, &led_event, 0);
+          if (key_index < LED_STRIP_LED_NUMBERS) {
+            led_event_t led_event = {
+                .type = LED_EVENT_NOTE_ON,
+                .key_index = (uint8_t)key_index,
+                .velocity = 127};
+            xQueueSend(led_msgq, &led_event, 0);
+          }
 
           send_midi_note(key->midi_note, 127, true);
         }
@@ -419,16 +448,73 @@ static void process_key_logic(int key_index, bool s1_raw, bool sa_raw) {
       // SA Falling Edge (Start of Release)
       else if (!key->sa_stable) {
         key->sa_release_time = now;
+
+        // Robust Release: If SA is released and S1 is already released (or was
+        // never hit), ensure the note is released to prevent "stuck" LEDs.
+        if (key->key_pressed && !key->s1_stable) {
+          // Use hold duration as release velocity signal.
+          // (sa_release_time was just set to 'now' so now - sa_release_time
+          //  would always be 0; start_time is when the note was triggered.)
+          int64_t release_delta = now - key->start_time;
+          int release_vel = calculate_velocity(release_delta);
+
+          ESP_LOGI(TAG, "Key %d (%s%d): Released (fallback path) | HoldDelta: %lld us | RelVel: %d",
+                   key_index, get_note_name(key->midi_note),
+                   (key->midi_note / 12) - 1, (long long)release_delta, release_vel);
+
+          // Signal LED thread to turn off
+          if (key_index < LED_STRIP_LED_NUMBERS) {
+            led_event_t led_event = {
+                .type = LED_EVENT_NOTE_OFF,
+                .key_index = (uint8_t)key_index,
+                .velocity = 0};
+            xQueueSend(led_msgq, &led_event, 0);
+          }
+
+          key->attack_start_time = 0;
+          send_midi_note(key->midi_note, release_vel, false);
+          key->key_pressed = false;
+        }
       }
     }
   }
 
-  // Timeout Check
-  if (key->timer_running && (now - key->start_time > VELOCITY_TIMEOUT_US)) {
+  // Timeout Check: If S1 is pressed but SA (Second Contact) is delayed, 
+  // auto-trigger the note with a default velocity.
+  if (key->timer_running && (now - key->start_time > TRIGGER_TIMEOUT_US)) {
     key->timer_running = false;
-    ESP_LOGW(TAG, "Key %d (%s%d): Velocity Timeout", key_index,
-             get_note_name(key->midi_note), (key->midi_note / 12) - 1);
+    key->key_pressed = true;
+    
+    // Default velocity for slow/missed contact
+    key->velocity = 64 + (rand() % 20) - 10; 
+    
+    ESP_LOGW(TAG, "Key %d (%s%d): Triggering on timeout | Vel: %d", 
+             key_index, get_note_name(key->midi_note), (key->midi_note / 12) - 1, 
+             key->velocity);
+
+    // Send LED ON event to queue
+    if (key_index < LED_STRIP_LED_NUMBERS) {
+      led_event_t led_event = {
+          .type = LED_EVENT_NOTE_ON,
+          .key_index = (uint8_t)key_index,
+          .velocity = key->velocity};
+      xQueueSend(led_msgq, &led_event, 0);
+    }
+    
+    send_midi_note(key->midi_note, key->velocity, true);
   }
+
+  // S1 Grace Period Check: If S1 was released while waiting for SA, 
+  // abort After the grace period passes.
+  if (key->timer_running && !key->s1_stable && !key->key_pressed) {
+    if ((now - key->s1_last_change) > S1_GRACE_PERIOD_US) {
+      key->timer_running = false;
+      key->last_s1_abort_time = now;
+      ESP_LOGD(TAG, "Key %d (%s%d): S1 Released before SA (Grace period expired - Aborted)",
+               key_index, get_note_name(key->midi_note), (key->midi_note / 12) - 1);
+    }
+  }
+  xSemaphoreGive(key_state_mutex);
 }
 
 // LED Thread - Runs at 60 FPS on Core 0
@@ -445,12 +531,22 @@ static void led_thread_entry(void *arg) {
       if (event.key_index >= LED_STRIP_LED_NUMBERS)
         continue;
 
-      if (event.type == LED_EVENT_NOTE_ON) {
-        // Calculate target color - simple white gradient based on velocity
-        target_pixels[event.key_index] = get_led_color(event.velocity);
-      } else {
-        // Note OFF - fade to black
-        target_pixels[event.key_index] = (rgb_color_t){0, 0, 0};
+      if (xSemaphoreTake(led_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        // key_state_mutex taken INSIDE led_mutex – always in this order to
+        // prevent deadlock (scan_task only ever takes key_state_mutex).
+        xSemaphoreTake(key_state_mutex, portMAX_DELAY);
+        if (event.type == LED_EVENT_NOTE_ON) {
+          keys[event.key_index].attack_start_time = esp_timer_get_time();
+          target_pixels[event.key_index] = get_led_color_with_attack(
+              event.velocity, keys[event.key_index].attack_start_time);
+          // Instant response: bypass lerp for the initial hit
+          pixels[event.key_index] = target_pixels[event.key_index];
+        } else {
+          keys[event.key_index].attack_start_time = 0;
+          target_pixels[event.key_index] = (rgb_color_t){0, 0, 0};
+        }
+        xSemaphoreGive(key_state_mutex);
+        xSemaphoreGive(led_mutex);
       }
     }
 
@@ -459,37 +555,89 @@ static void led_thread_entry(void *arg) {
     if (xSemaphoreTake(led_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
       int64_t now = esp_timer_get_time();
 
-      // Update attack effect ONLY for keys that are pressed AND within attack
-      // duration
-      for (int i = 0; i < NUM_KEYS && i < LED_STRIP_LED_NUMBERS; i++) {
-        if (keys[i].key_pressed && keys[i].attack_start_time > 0) {
-          int64_t attack_elapsed_ms = (now - keys[i].attack_start_time) / 1000;
+      // Read keys[] under key_state_mutex (taken inside led_mutex, same order
+      // as Phase 1 above – prevents deadlock with scan_task on Core 1).
+      xSemaphoreTake(key_state_mutex, portMAX_DELAY);
 
-          // Only update if still within attack duration
-          if (attack_elapsed_ms < LED_ATTACK_DURATION_MS) {
-            target_pixels[i] = get_led_color_with_attack(
-                keys[i].velocity, keys[i].attack_start_time);
+      // Update attack effect and ensure state consistency (THREAD SAFE)
+      for (int i = 0; i < NUM_KEYS && i < LED_STRIP_LED_NUMBERS; i++) {
+        if (keys[i].key_pressed) {
+          if (keys[i].attack_start_time > 0) {
+            int64_t attack_elapsed_ms = (now - keys[i].attack_start_time) / 1000;
+            if (attack_elapsed_ms < LED_ATTACK_DURATION_MS) {
+              target_pixels[i] = get_led_color_with_attack(
+                  keys[i].velocity, keys[i].attack_start_time);
+            } else {
+              // End of attack: stay at stable color
+              target_pixels[i] = get_led_color(keys[i].velocity);
+            }
           }
+        } else {
+          // KEY RELEASED: Ensure target is black
+          target_pixels[i] = (rgb_color_t){0, 0, 0};
         }
       }
 
-      // Lerp animation
+      xSemaphoreGive(key_state_mutex);
+
+      // Lerp animation (pixel buffers only – no keys[] access needed)
       for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
         lerp_color(&pixels[i], &target_pixels[i]);
       }
       xSemaphoreGive(led_mutex);
     }
 
-    // Startup Animation Override
+    // Ultra-Premium 'Ember to Moonlight' Transition (6-second sequence)
     int64_t now = esp_timer_get_time();
     if (now < startup_end_time) {
-      float time_sec = (float)now / 1000000.0f;
+      // Compute elapsed time from animation start (not absolute uptime).
+      // startup_end_time = anim_start + 6s, so anim_start = startup_end_time - 6s.
+      const float total_duration = 6.0f;
+      int64_t anim_start = startup_end_time - 6000000LL;
+      float elapsed_sec = (float)(now - anim_start) / 1000000.0f;
+      float progress = elapsed_sec / total_duration; // 0.0 → 1.0
+
+      // Cinematic Ease-In/Out for Global Brightness
+      float global_brightness = smoothstep(0.0f, 0.2f, progress) *
+                                smoothstep(1.0f, 0.8f, progress);
+
       for (int i = 0; i < LED_STRIP_LED_NUMBERS; i++) {
-        // Rainbow wave effect
-        float phase = time_sec * 3.0f + i * 0.3f;
-        pixels[i].r = (uint8_t)(60 + 60 * sinf(phase));
-        pixels[i].g = (uint8_t)(60 + 60 * sinf(phase + 2.094f)); // 120 deg
-        pixels[i].b = (uint8_t)(60 + 60 * sinf(phase + 4.188f)); // 240 deg
+        // Spatial math: 0.0 at center, 1.0 at ends
+        float center = (LED_STRIP_LED_NUMBERS - 1) / 2.0f;
+        float norm_dist = fabsf((float)i - center) / center;
+
+        // Stage 1: Warm Ember Blow (Goldenrod / Burnt Orange)
+        // Stage 2: Moonlit Cool (Midnight Blue / Silver)
+        float stage1 = smoothstep(0.8f, 0.2f, progress);
+        float stage2 = smoothstep(0.3f, 0.9f, progress);
+
+        // Dynamic "Breath" pulse (uses elapsed_sec so phase starts at 0)
+        float breath = 0.7f + 0.3f * sinf(elapsed_sec * 1.4f);
+
+        // Organic Glow Spread (Liquid movement)
+        // Center glows first, then spreads outward like heat
+        float heat_map = expf(-norm_dist * (4.0f - 3.5f * progress));
+
+        // Composite Color logic (R,G,B as 0.0 - 255.0)
+        // Stage 1 palette
+        float r1 = 255.0f * heat_map * breath;
+        float g1 = 110.0f * heat_map;
+        float b1 = 25.0f * (1.0f - norm_dist);
+
+        // Stage 2 palette
+        float r2 = 60.0f * norm_dist;
+        float g2 = 140.0f * (1.0f - heat_map);
+        float b2 = 255.0f * heat_map * stage2;
+
+        // Blending Phase
+        float final_r = (r1 * stage1) + (r2 * stage2 * 0.6f);
+        float final_g = (g1 * stage1) + (g2 * stage2);
+        float final_b = (b1 * stage1) + (b2 * stage2);
+
+        // Perceived Luminosity (Gamma 2.2) to eliminate "stepping" at low levels
+        pixels[i].r = (uint8_t)(powf(final_r / 255.0f, 1.8f) * 255.0f * global_brightness);
+        pixels[i].g = (uint8_t)(powf(final_g / 255.0f, 1.8f) * 255.0f * global_brightness);
+        pixels[i].b = (uint8_t)(powf(final_b / 255.0f, 1.8f) * 255.0f * global_brightness);
       }
     }
 
@@ -537,6 +685,8 @@ static void scan_task(void *arg) {
     }
   }
 }
+
+
 
 void app_main(void) {
   esp_err_t ret = nvs_flash_init();
@@ -605,16 +755,21 @@ void app_main(void) {
   ESP_LOGI(TAG, "LED Strip initialized on GPIO %d", LED_STRIP_GPIO_PIN);
 
   // Create LED message queue and mutex for thread safety
-  led_msgq = xQueueCreate(128, sizeof(led_event_t));
+  led_msgq = xQueueCreate(256, sizeof(led_event_t));
   led_mutex = xSemaphoreCreateMutex();
   if (led_mutex == NULL) {
     ESP_LOGE(TAG, "Failed to create LED mutex!");
+  }
+  key_state_mutex = xSemaphoreCreateMutex();
+  if (key_state_mutex == NULL) {
+    ESP_LOGE(TAG, "FATAL: Failed to create key state mutex!");
+    abort();
   }
   if (led_msgq == NULL) {
     ESP_LOGE(TAG, "FATAL: Failed to create LED message queue");
     abort(); // Cannot continue without LED queue
   }
-  ESP_LOGI(TAG, "LED message queue created (128 events)");
+  ESP_LOGI(TAG, "LED message queue created (256 events)");
   // Initialize pixel buffers to black
   memset(pixels, 0, sizeof(pixels));
   memset(target_pixels, 0, sizeof(target_pixels));
@@ -649,6 +804,7 @@ void app_main(void) {
     keys[i].sa_last_change = 0;
     keys[i].sa_release_time = 0;
     keys[i].attack_start_time = 0; // Initialize attack timer
+    keys[i].last_s1_abort_time = 0;
   }
 
   // Reset all pins to clear any default JTAG/Boot functions
@@ -684,7 +840,7 @@ void app_main(void) {
   gpio_config(&col_conf);
 
   // Set all columns LOW (inactive for Active-High)
-  for (int c = 0; c < COLS_PER_MATRIX; c++) {
+  for (int c = 0; c < COLS_PER_MATRIX; c++) {  
     gpio_set_level(shared_cols[c], 0);
   }
 
